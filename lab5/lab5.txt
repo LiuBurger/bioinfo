@@ -1,0 +1,41 @@
+The aim of this laboratory exercise is to design and train a MetaFormer model
+that can categorize a protein into its corresponding CATH super-family, using
+its sequence as input. Moreover, implement a small experiment to evaluate the
+performance of your MetaFormer model.
+
+To ensure your comprehensive understanding of multi-head-attention (MHA)
+layers, you will need to create your own implementation of MHA layers from
+dense layers and einsum functions. This implies that you cannot directly
+utilize the transformer or MHA layers provided by PyTorch or TensorFlow.
+
+
+#### lab submission ####
+
+- report.ipynb  describe your experiment settings, results and conclusions
+- {train,model,data}.py
+                source codes for model training, model implementation, and data
+                flow
+- train.sh      script to start training
+
+
+#### fastvit23.pdf and sparse19.pdf ####
+
+In order to save computational resources, you can do the followings:
+
+- Similar to the FastViT model, a single late attention later can be adopted
+  instead of using attention for all layers.
+- Similar to the Sparse transformer model, sparse attentions can be employed
+  instead of using pairwise attentions.
+- Downsampling is another simple solution to reduce computational costs.
+
+
+#### WARNING ####
+
+You are requested to configure your program to utilize only one GPU. The use of
+multiple graphics cards is strictly prohibited for all labs. To illustrate, the
+command below can compel your software to employ only the first GPU device.
+
+export CUDA_VISIBLE_DEVICES=0
+
+fastvit23.pdf
+sparse19.pdf

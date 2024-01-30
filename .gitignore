@@ -1,0 +1,5 @@
+# 如果本地仓库文件已被跟踪，那么即使在 .gitignore 中设置了忽略，也不起作用
+# 
+__pycache__
+*.out
+project/
