@@ -52,11 +52,13 @@ class ProteinDataset(Dataset):
         # N-α-β这个夹角反映了氨基酸的空间结构，在化学键确定的前提下，N和β之间的距离就能反应角度 
         seq_[:, 20] = pt.sqrt(pt.sum((node_pos[:,0] - node_pos[:,4])**2, dim=1))
         
-        # 连接关系 
+        # 连接关系(氢键) 
         edge_nho = pt.stack((self.edge_nho[0][self.edge_idx[idx_] : self.edge_idx[idx_+1]],
-                             self.edge_nho[1][self.edge_idx[idx_] : self.edge_idx[idx_+1]]),dim=0)
+                             self.edge_nho[1][self.edge_idx[idx_] : self.edge_idx[idx_+1]]), dim=0)
+        # 连接关系(肽键)
         edge_tai = pt.stack((pt.arange(0, len_seq-1), pt.arange(1, len_seq)), dim=0)
-        edge_idx = pt.cat((edge_nho, edge_tai), dim=1)
+        # 连接关系
+        edge_idx = pt.cat((edge_tai, edge_nho), dim=1)
         # 边长 
         nho_attr = pt.empty(edge_nho.shape[1])
         # 氢键：氨基的氢和羧基的氧之间吸引产生，用氨基的氮坐标代替氢坐标 
@@ -64,12 +66,12 @@ class ProteinDataset(Dataset):
         tai_attr = pt.empty(edge_tai.shape[1])
         # 羧基碳接氨基氮
         tai_attr[:] = pt.sqrt(pt.sum((node_pos[edge_tai[0][:], 2] - node_pos[edge_tai[1][:], 0])**2, dim=1))
-        edge_attr = pt.cat((nho_attr, tai_attr))[:, None]
+        edge_attr = pt.cat((tai_attr, nho_attr))[:, None]
         
         lab = self.lab[idx_]
         one_hot = pt.zeros(6630, dtype=pt.float32)
         one_hot[lab[0]] = 1.0
-        graph = Data(x=seq_, edge_index=edge_idx, edge_attr=edge_attr, y=one_hot, pos=node_pos[:,1])
+        graph = Data(x=seq_, edge_index=edge_idx, edge_attr=edge_attr, y=one_hot)
 
         return graph
         

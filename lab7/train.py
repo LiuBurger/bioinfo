@@ -87,4 +87,4 @@ if __name__ == '__main__':
                  time.localtime(time.time())))
 
 
-# ps -aux | grep Burger
+# ps -aux | grep burger
