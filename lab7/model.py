@@ -48,7 +48,7 @@ class HeteroGCNConv(nn.Module):
         # edge_index:[2, N-1+num_nho] edge_attr:[N-1+num_nho, 1]
         N = x.size(0)
         tai_idx = pt.stack((edge_index[0, :N-1], edge_index[1, :N-1]), dim=0)
-        tai_idx = pt.cat((tai_idx, tai_idx.flip(0)), dim=1)
+        tai_idx = pt.cat((tai_idx, tai_idx.flip(0)), dim=1) # 两条有向边 
         nho_idx = pt.stack((edge_index[0, N-1:], edge_index[1, N-1:]), dim=0)
         nho_idx = pt.cat((nho_idx, nho_idx.flip(0)), dim=1)
         tai_attr = edge_attr[:N-1]
