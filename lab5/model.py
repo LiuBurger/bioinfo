@@ -44,17 +44,16 @@ class Conv1d(nn.Module):
 
     def forward(self, x):    
         # x：(batch_size, in_channel, in_len)
-        out_len = (x.shape[2] + 2*self.pad - self.ker_size)//self.stride + 1
+        # out_len = (x.shape[2] + 2*self.pad - self.ker_size)//self.stride + 1
         x = nn.functional.pad(x, (self.pad, self.pad), "constant", 0)
         
         # (batch_size, in_ch, 1, in_len) -> (batch_size, in_ch*ker_size, out_len)
-        x_unfold = nn.functional.unfold(x.unsqueeze(2), 
+        x_unfold = nn.functional.unfold(x[:,:,None,:], 
                                         kernel_size=(1,self.ker_size), stride=(1,self.stride))
-        out = self.kernel.view(self.out_ch, -1).matmul(x_unfold).view(x.shape[0], self.out_ch, out_len)
+        out = self.kernel.view(self.out_ch, -1).matmul(x_unfold)
                  
         if self.bias is not None:
-            b = pt.unsqueeze(self.bias, 0).unsqueeze(2)
-            out += b
+            out += self.bias[None,:,None]
  
         return out
 
