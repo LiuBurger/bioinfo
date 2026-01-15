@@ -1,0 +1,3 @@
+- use notebook.sh to load Jupytor notebook for coding
+- complete all tasks in "lab0.ipynb"
+- save and submit your Jupytor notebook

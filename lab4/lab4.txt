@@ -1,0 +1,44 @@
+The aim of this laboratory exercise is to design and train a Convolutional
+Neural Network (CNN) model that can categorize a protein into its corresponding
+CATH super-family, using its sequence as input. Moreover, implement a small
+experiment to evaluate the performance of your CNN model.
+
+To ensure your comprehensive understanding of convolutional layers, you will
+need to create your own implementation of convolutional layers from dense
+layers. This implies that you cannot directly utilize the convolutional layers
+provided by PyTorch or TensorFlow.
+
+
+#### lab submission ####
+
+- report.ipynb  describe your experiment settings, results and conclusions
+- {train,model,data}.py
+                source codes for model training, model implementation, and data
+                flow
+- train.sh      script to start training
+
+
+#### nbt22pfam.pdf ####
+
+This is a scholarly article published in Nature Biotechnology in 2022, used as
+a reference, detailing the classification of a protein into its Pfam family.
+Feel free to architect your own CNN model, even if it diverges from the one
+detailed in the research paper.
+
+
+#### train.out ####
+
+An example output from training a CNN model for the purpose of categorizing a
+protein into its respective CATH superfamily. Again, it's your responsibility
+to design a sensible experiment to assess your model. It's not obligatory to
+adhere to the example provided.
+
+
+#### WARNING ####
+
+You are requested to configure your program to utilize only one GPU. The use of
+multiple graphics cards is strictly prohibited for all labs. To illustrate, the
+command below can compel your software to employ only the first GPU device.
+
+export CUDA_VISIBLE_DEVICES=0
+

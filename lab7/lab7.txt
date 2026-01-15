@@ -1,0 +1,36 @@
+The aim of this laboratory exercise is to design and train a Message-Passing
+Neural Network (MPNN) model that can categorize a protein into its
+corresponding CATH super-family, using its sequence and structure as input.
+Moreover, implement a small experiment to evaluate the performance of your MPNN
+model.
+
+To ensure your comprehensive understanding of MPNN layers, you will need to
+create your own implementation of MPNN layers from MessagePassing layers. This
+implies that you cannot directly utilize other graph neural network layers
+provided by PyG (or other PyTorch Geometric libraries).
+
+
+#### lab submission ####
+
+- report.ipynb  describe your experiment settings, results and conclusions
+- {train,model,data}.py
+                source codes for model training, model implementation, and data
+                flow
+- train.sh      script to start training
+
+
+#### sci22mpnn.pdf / nc21gcn.pdf ####
+
+These reference articles introduces MPNN models for structure-based protein
+design and prediction tasks.  Feel free to architect your own CNN model, even
+if it diverges from the one detailed in the research paper.
+
+
+#### WARNING ####
+
+You are requested to configure your program to utilize only one GPU. The use of
+multiple graphics cards is strictly prohibited for all labs. To illustrate, the
+command below can compel your software to employ only the first GPU device.
+
+export CUDA_VISIBLE_DEVICES=0
+
