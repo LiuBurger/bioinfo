@@ -11,7 +11,7 @@ os.environ["CUDA_VISIBLE_DEVICES"] = "6"
 
 data_ = load('../../cath/hdf5/struct256.hdf5')
 dataset = ProteinDataset(data_)
-datamap=pt.arange(len(dataset),dtype=pt.int32) 
+datamap = pt.arange(len(dataset), dtype=pt.int32) 
 batchsize = 256
 # all: 21,5799
 trainmap,validmap=train_test_split(datamap,test_size=20480,random_state=7)
