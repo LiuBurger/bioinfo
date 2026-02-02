@@ -4,4 +4,6 @@ __pycache__
 *.out
 *.hdf5
 *.fasta
+*.pt
+*.pth
 project/TMalign

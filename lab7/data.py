@@ -1,6 +1,7 @@
 # add your source codes regarding the data fllow here
 import h5py
 import torch as pt
+import numpy as np
 from torch_geometric.data import Data, Dataset
 
 
@@ -25,7 +26,7 @@ class ProteinDataset(Dataset):
             self.edge_nho = pt.tensor(dataset[3], dtype=pt.int32)
             self.edge_idx = pt.tensor(dataset[4])
             self.lab = pt.tensor(dataset[5])
-            self.map = pt.arange(len(self.lab), dtype=pt.int32) # 恒等映射 
+            self.map = np.arange(len(self.lab), dtype=np.int64) # 恒等映射 
             assert len(self.seq) == self.node_idx[-1]
             assert len(self.lab) == len(self.node_idx) - 1
             assert len(self.lab) == len(self.edge_idx) - 1
