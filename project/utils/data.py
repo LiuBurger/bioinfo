@@ -98,8 +98,22 @@ def pair_collate_fn(batch):
     seqs_graphs_i, seqs_graphs_j, scores = zip(*batch)
     seqs_i, graphs_i = zip(*seqs_graphs_i)
     seqs_j, graphs_j = zip(*seqs_graphs_j)
-    seqs_i = pt.stack(seqs_i)
-    seqs_j = pt.stack(seqs_j)
-    batch_graph_i = Batch.from_data_list(graphs_i)
-    batch_graph_j = Batch.from_data_list(graphs_j)
-    return (seqs_i, batch_graph_i), (seqs_j, batch_graph_j), pt.stack(scores, dim=0)
+    graphs_i = Batch.from_data_list(graphs_i)
+    graphs_j = Batch.from_data_list(graphs_j)
+    seqs_list_i, masks_i = [], []
+    seqs_list_j, masks_j = [], []
+    max_len_i = max([len(seq) for seq in seqs_i])
+    max_len_j = max([len(seq) for seq in seqs_j])
+    for seq in seqs_i:
+        pad_num = max_len_i - len(seq)
+        seqs_list_i.append(np.pad(seq, (0, pad_num)))
+        masks_i.append(np.pad(np.ones_like(seq, dtype=np.bool_), (0, pad_num)))
+    for seq in seqs_j:
+        pad_num = max_len_j - len(seq)
+        seqs_list_j.append(np.pad(seq, (0, pad_num)))
+        masks_j.append(np.pad(np.ones_like(seq, dtype=np.bool_), (0, pad_num)))
+    seqs_list_i = pt.tensor(seqs_list_i, dtype=pt.long)
+    seqs_list_j = pt.tensor(seqs_list_j, dtype=pt.long)
+    masks_i = pt.tensor(masks_i, dtype=pt.bool)
+    masks_j = pt.tensor(masks_j, dtype=pt.bool)
+    return (seqs_list_i, masks_i, graphs_i), (seqs_list_j, masks_j, graphs_j), pt.stack(scores, dim=0)
