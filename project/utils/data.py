@@ -4,6 +4,7 @@ import numpy as np
 from torch_geometric.data import Batch
 from torch.utils.data import Dataset
 import pandas as pd
+import torch.nn.functional as F
 
 
 def load(fn):
@@ -106,14 +107,14 @@ def pair_collate_fn(batch):
     max_len_j = max([len(seq) for seq in seqs_j])
     for seq in seqs_i:
         pad_num = max_len_i - len(seq)
-        seqs_list_i.append(np.pad(seq, (0, pad_num)))
-        masks_i.append(np.pad(np.ones_like(seq, dtype=np.bool_), (0, pad_num)))
+        seqs_list_i.append(F.pad(seq, (0, pad_num)))
+        masks_i.append(F.pad(pt.ones_like(seq), (0, pad_num)))
     for seq in seqs_j:
         pad_num = max_len_j - len(seq)
-        seqs_list_j.append(np.pad(seq, (0, pad_num)))
-        masks_j.append(np.pad(np.ones_like(seq, dtype=np.bool_), (0, pad_num)))
-    seqs_list_i = pt.tensor(seqs_list_i, dtype=pt.long)
-    seqs_list_j = pt.tensor(seqs_list_j, dtype=pt.long)
-    masks_i = pt.tensor(masks_i, dtype=pt.bool)
-    masks_j = pt.tensor(masks_j, dtype=pt.bool)
+        seqs_list_j.append(F.pad(seq, (0, pad_num)))
+        masks_j.append(F.pad(pt.ones_like(seq), (0, pad_num)))
+    seqs_list_i = pt.stack(seqs_list_i)
+    seqs_list_j = pt.stack(seqs_list_j)
+    masks_i = pt.stack(masks_i)
+    masks_j = pt.stack(masks_j)
     return (seqs_list_i, masks_i, graphs_i), (seqs_list_j, masks_j, graphs_j), pt.stack(scores, dim=0)
