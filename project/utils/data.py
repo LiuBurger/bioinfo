@@ -58,8 +58,8 @@ class ProteinPairDataset(Dataset):
             df = pd.read_csv(pair_file, names=['name1', 'name2', 'tmscore', 'seqid'], delimiter='\t')
             df['name1'] = df['name1'].str.split('/').str[-1].str.removesuffix('.pdb')
             df['name2'] = df['name2'].str.split('/').str[-1].str.removesuffix('.pdb')
-            df['idx1'] = df['name1'].map(pdb2idx)
-            df['idx2'] = df['name2'].map(pdb2idx)
+            df['idx1'] = df['name1'].map(pdb2idx).astype(np.int64)
+            df['idx2'] = df['name2'].map(pdb2idx).astype(np.int64)
             df = df.dropna(subset=['idx1', 'idx2'])
             self.idx1 = df['idx1'].values
             assert len(self.idx1) > 0, "No valid protein pairs found!"
