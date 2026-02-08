@@ -37,8 +37,8 @@ class ProteinDataset(Dataset):
     # self.map旨在维护一个data子集的映射，数据仍然是全部数据   
 
     def __getitem__(self, idx):
-        idx_ = self.map[idx]
-        seq, graph, lab = self.seq[idx_], self.graph[idx_], self.lab[idx_]
+        idx = self.map[idx]
+        seq, graph, lab = self.seq[idx], self.graph[idx], self.lab[idx]
         return seq, graph, lab
 
     def __len__(self):  
@@ -73,8 +73,8 @@ class ProteinPairDataset(Dataset):
             assert np.max(self.map) < len(self.idx1)
     
     def __getitem__(self, idx):
-        idx_ = self.map[idx]
-        return self.idx1[idx_], self.idx2[idx_], self.tm[idx_], self.seqid[idx_]
+        idx = self.map[idx]
+        return self.idx1[idx], self.idx2[idx], self.tm[idx], self.seqid[idx]
 
     def __len__(self):
         return len(self.map)
