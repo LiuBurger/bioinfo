@@ -10,21 +10,28 @@ import torch.nn.functional as F
 def load(fn):
     with h5py.File(fn) as f:
         seq = f['node_seq'][()].astype(np.int32)
+        node_ss = f['node_ss'][()].astype(np.int32)
+        node_rsa = f['node_rsa'][()].astype(np.float32)
         node_pos = f['node_pos'][()].astype(np.float32)
         node_idx = f['node_idx'][()]
         edge_nho = f['edge_nho'][()].astype(np.int32)
         edge_idx = f['edge_idx'][()]
-        lab = f['label'][()].astype(str)
-    return seq, node_pos, node_idx, edge_nho, edge_idx, lab
+        lab = f['label'][()]
+    return seq, node_ss, node_rsa, node_pos, node_idx, edge_nho, edge_idx, lab
 
 
 class ProteinDataset(Dataset):
-    def __init__(self, dataset, mapping:np.ndarray=None):
+    def __init__(self, dataset, mapping:np.ndarray=None, label_type:str='str'):
         super().__init__()
         if isinstance(dataset, tuple): # raw data
             self.seq = dataset[0]
             self.graph = dataset[1]
-            self.lab = dataset[2]
+            if label_type == 'str':
+                self.lab = dataset[2].astype(str)
+            elif label_type == 'int':
+                self.lab = dataset[2].astype(np.int64)
+            else:
+                raise ValueError("Unsupported label type: choose 'str' or 'int'.")
             self.map = np.arange(len(self.lab), dtype=np.int64) # 恒等映射 
             assert len(self.seq) == len(self.graph) == len(self.lab)
         else: # structured data
