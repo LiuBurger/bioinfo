@@ -6,4 +6,5 @@ __pycache__
 *.fasta
 *.pt
 *.pth
+*.txt
 project/TMalign
