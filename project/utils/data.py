@@ -92,7 +92,7 @@ class ProteinPairDataset(Dataset):
 
     def __len__(self):
         return len(self.map)
-    
+
 
 def pair_collate_fun(protein_dataset: ProteinDataset):
     def collate_fun(batch): 
@@ -123,3 +123,83 @@ def pair_collate_fun(protein_dataset: ProteinDataset):
         graphs = Batch.from_data_list(graphs)
         return (seqs_pad, masks, graphs), (inv_i, inv_j), score
     return collate_fun
+
+
+def collate_fun_emb(batch):
+    seqs_pad, masks = [], []
+    max_len = max(len(seq) for seq, _, _ in batch)
+    for seq, _, _ in batch:
+        pad_len = max_len - len(seq)
+        seqs_pad.append(F.pad(seq, (0, pad_len), value=0))
+        masks.append(F.pad(pt.ones(len(seq), dtype=pt.bool), (0, pad_len), value=False))
+    seqs_pad = pt.stack(seqs_pad, dim=0)
+    masks = pt.stack(masks, dim=0)
+    return seqs_pad, masks
+
+
+def collate_fun_mlm(batch, mask_prob:float=0.15):
+    seqs_pad, masks_pad = collate_fun_emb(batch)
+    labels = pt.full_like(seqs_pad, 0, dtype=pt.long)
+    # 生成随机掩码位置
+    prob_matrix = pt.full(seqs_pad.shape, mask_prob)
+    masked_indices = pt.bernoulli(prob_matrix).bool()
+    # 在padding位置不进行掩码
+    masked_indices = masked_indices & masks_pad
+    # 将原始token保存为标签（仅在被掩码的位置）
+    labels[masked_indices] = seqs_pad[masked_indices]
+    # 80%替换为[MASK]
+    indices_mask = pt.bernoulli(pt.full(seqs_pad.shape, 0.8)).bool() & masked_indices
+    seqs_pad[indices_mask] = 0  # [MASK] token id
+    # 10%替换为随机token
+    indices_random = (
+        pt.bernoulli(pt.full(seqs_pad.shape, 0.5)).bool() # 20% * 0.5 = 10%
+        & masked_indices 
+        & ~indices_mask # 在80%之外的20%
+    )
+    random_tokens = pt.randint(1, 21, seqs_pad.shape, dtype=seqs_pad.dtype) # 假设token id范围是1-20，0是[MASK]
+    seqs_pad[indices_random] = random_tokens[indices_random]
+    # 剩余10%保持不变（不需要操作）
+    return seqs_pad, masks_pad, labels
+
+
+# class ProteinDataset_finetuning(Dataset):
+#     def __init__(self, dataset, mapping:np.ndarray=None):
+#         super().__init__()
+#         if isinstance(dataset, tuple): # raw data
+#             self.seq = dataset[0]
+#             self.lab = dataset[2]
+#             self.map = tuple([
+#                 np.arange(len(self.lab), dtype=np.int64),
+#                 np.arange(len(self.lab), dtype=np.int64),
+#                 np.arange(len(self.lab), dtype=np.int64)
+#             ])
+#             assert len(self.seq) == len(self.lab)
+#         else: # structured data
+#             assert mapping is not None, "Mapping must be provided for structured data."
+#             self.seq = dataset.seq
+#             self.lab = dataset.lab
+#             self.map = mapping
+#             assert np.max(self.map) < len(self.lab)
+#     # self.map旨在维护一个data子集的映射，数据仍然是全部数据   
+
+#     def __getitem__(self, idx):
+#         idx_query = self.map[0][idx]
+#         idx_true = self.map[1][idx]
+#         idx_false = self.map[2][idx]
+#         seq_query = self.seq[idx_query]
+#         lab_query = self.lab[idx_query]
+#         seq_true = self.seq[idx_true]
+#         lab_true = self.lab[idx_true]
+#         seq_false = self.seq[idx_false]
+#         lab_false = self.lab[idx_false]
+#         return (seq_query, lab_query), (seq_true, lab_true), (seq_false, lab_false)
+
+#     def __len__(self):  
+#         return len(self.map[0]) #子集的大小是map的大小
+
+
+# def collate_fun_finetune(batch):
+#     query = [b[0] for b in batch]
+#     true = [b[1] for b in batch]
+#     false = [b[2] for b in batch]
+#     return collate_fun_emb(query), collate_fun_emb(true), collate_fun_emb(false)
