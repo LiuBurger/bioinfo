@@ -33,18 +33,23 @@ def load(fn, mode:str='all'):
 
 
 class ProteinDataset(Dataset):
-    def __init__(self, dataset, mapping:np.ndarray=None):
+    def __init__(self, dataset, mapping:np.ndarray=None, mode:str='graph'):
         super().__init__()
+        self.mode = mode
         if isinstance(dataset, tuple): # raw data
             self.seq = dataset[0]
-            self.graph = dataset[1]
-            self.lab = dataset[2]
+            if mode == 'graph':
+                self.graph = dataset[1]
+                self.lab = dataset[2]
+            elif mode == 'seq':
+                self.lab = dataset[1]
             self.map = np.arange(len(self.lab), dtype=np.int64) # 恒等映射 
             assert len(self.seq) == len(self.graph) == len(self.lab)
         else: # structured data
             assert mapping is not None, "Mapping must be provided for structured data."
             self.seq = dataset.seq
-            self.graph = dataset.graph
+            if mode == 'graph':
+                self.graph = dataset.graph
             self.lab = dataset.lab
             self.map = mapping
             assert np.max(self.map) < len(self.lab)
@@ -52,8 +57,12 @@ class ProteinDataset(Dataset):
 
     def __getitem__(self, idx):
         idx = self.map[idx]
-        seq, graph, lab = self.seq[idx], self.graph[idx], self.lab[idx]
-        return seq, graph, lab
+        seq, lab = self.seq[idx], self.lab[idx]
+        if self.mode == 'graph':
+            graph = self.graph[idx]
+            return seq, graph, lab
+        elif self.mode == 'seq':
+            return seq, lab
 
     def __len__(self):  
         return len(self.map) #子集的大小是map的大小

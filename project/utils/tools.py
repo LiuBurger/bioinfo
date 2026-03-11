@@ -5,6 +5,9 @@ from torch.utils.data import DataLoader
 import faiss
 from datetime import datetime
 from os.path import exists
+import subprocess
+import re
+from utils.data import ProteinDataset
 
 
 def gen_embeddings(model:nn.Module, loader:DataLoader, gpu:int):
@@ -44,6 +47,33 @@ def build_idx(embs_lib:np.ndarray, embs_test:np.ndarray, gpu:int, topk:int=200, 
     else:
         index_flat.reset()
         return I, Distance
+
+
+def run_tmalign(pdb1, pdb2, tmalign_path="./TMalign", reference=1):
+    cmd = [tmalign_path, pdb1, pdb2]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    output = result.stdout
+    # aligned_len = int(re.search(r"Aligned length=\s*(\d+)", output).group(1))
+    # rmsd = float(re.search(r"RMSD=\s*([0-9.]+)", output).group(1))
+    seqid = float(re.search(r"Seq_ID=.*?=\s*([0-9.]+)", output).group(1))
+    tm_scores = re.findall(r"TM-score=\s*([0-9.]+)", output)
+    tm_score = float(tm_scores[reference - 1])
+    return tm_score, seqid, # aligned_len, # rmsd
+
+
+def calculate_score(query:ProteinDataset, database:ProteinDataset, idx:list, k:int=12):
+    N = len(query)
+    assert N == len(idx), 'The length of query and idx should be the same.'
+    score = 0.0
+    for i in range(N):
+        query_name = '../../data/pdb/'+query[i][-1][1:3]+'/'+query[i][-1]+'.pdb'
+        candidate_idx = idx[i][:k]
+        candidate_name = [database[j][-1] for j in candidate_idx]
+        candidate_name = ['../../data/pdb/'+n[1:3]+'/'+n+'.pdb' for n in candidate_name]
+        for candidate in candidate_name:
+            tm_score, seqid = run_tmalign(query_name, candidate)
+            score += tm_score-0.6 + min(0.4-seqid, 0.0)
+    return score/N
 
 
 def save_model(model:nn.Module, model_name:str, epoch:int):
