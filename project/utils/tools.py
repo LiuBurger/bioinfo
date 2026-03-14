@@ -59,19 +59,36 @@ def build_idx(embs_lib:np.ndarray, embs_test:np.ndarray, gpu:int, topk:int=200, 
 
 
 def make_pdb_path(pdb_root, pdb_name: str) -> Path:
-    """
-    根据 pdb_name 构造 PDB 文件路径。
-    例如 1abc -> ../../data/pdb/ab/1abc.pdb
-    """
     return Path(pdb_root) / pdb_name[1:3] / f"{pdb_name}.pdb"
 
 
+def generate_tasks(
+    query, database, idx: list,
+    k: int = 12,
+    pdb_root: str = "../../data/pdb",
+    tmalign_path: str = "./TMalign",
+    reference: int = 1,
+):
+    # 生成所有 (q_file, c_file, tmalign_path, reference) 任务
+    pdb_root = Path(pdb_root)
+    tmalign_path = Path(tmalign_path).resolve()
+    if not tmalign_path.is_file():
+        raise FileNotFoundError(f"TMalign binary not found: {tmalign_path}")
+    for i in range(len(query)):
+        q_name = query[i][-1]
+        q_file = make_pdb_path(pdb_root, q_name)
+        if not q_file.is_file():
+            raise FileNotFoundError(f"Query PDB file not found: {q_file}")
+        for j in idx[i][:k]:
+            c_name = database[int(j)][-1]
+            c_file = make_pdb_path(pdb_root, c_name)
+            if not c_file.is_file():
+                raise FileNotFoundError(f"Candidate PDB file not found: {c_file}")
+            yield (i, int(j), q_file, c_file, tmalign_path, reference)
+
+
 def run_tmalign(task):
-    """
-    task: (pdb1, pdb2, tmalign_path, reference)
-    返回单个 pair 的 score
-    """
-    pdb1, pdb2, tmalign_path, reference = task
+    q_idx, c_idx, pdb1, pdb2, tmalign_path, reference = task
     cmd = [str(tmalign_path), str(pdb1), str(pdb2)]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -100,40 +117,11 @@ def run_tmalign(task):
     seqid = float(seqid_match.group(1))
     tm_score = float(tm_scores[reference - 1])
     score = tm_score - 0.6 + min(0.4 - seqid, 0.0)
-    return score 
-
-
-def generate_tasks(
-    query,
-    database,
-    idx: list,
-    k: int = 12,
-    pdb_root: str = "../../data/pdb",
-    tmalign_path: str = "./TMalign",
-    reference: int = 1,
-):
-    # 生成所有 (q_file, c_file, tmalign_path, reference) 任务
-    pdb_root = Path(pdb_root)
-    tmalign_path = Path(tmalign_path).resolve()
-    if not tmalign_path.is_file():
-        raise FileNotFoundError(f"TMalign binary not found: {tmalign_path}")
-    for i in range(len(query)):
-        q_name = query[i][-1]
-        q_file = make_pdb_path(pdb_root, q_name)
-        if not q_file.is_file():
-            raise FileNotFoundError(f"Query PDB file not found: {q_file}")
-        for j in idx[i][:k]:
-            c_name = database[int(j)][-1]
-            c_file = make_pdb_path(pdb_root, c_name)
-            if not c_file.is_file():
-                raise FileNotFoundError(f"Candidate PDB file not found: {c_file}")
-            yield (q_file, c_file, tmalign_path, reference)
+    return q_idx, c_idx, score 
 
 
 def calculate_remote_homology_score(
-    query,
-    database,
-    idx: list,
+    query, database, idx: list,
     k: int = 12,
     pdb_root: str = "../../data/pdb",
     tmalign_path: str = "./TMalign",
@@ -151,13 +139,8 @@ def calculate_remote_homology_score(
     assert N == len(idx), "The length of query and idx should be the same."
     tasks = list(
         generate_tasks(
-            query=query,
-            database=database,
-            idx=idx,
-            k=k,
-            pdb_root=pdb_root,
-            tmalign_path=tmalign_path,
-            reference=reference,
+            query=query, database=database, idx=idx, k=k,
+            pdb_root=pdb_root, tmalign_path=tmalign_path, reference=reference,
         )
     )
     if len(tasks) == 0:
@@ -165,32 +148,41 @@ def calculate_remote_homology_score(
     if num_workers is None:
         cpu_count = os.cpu_count() or 1
         num_workers = max(1, min(len(tasks), cpu_count // 2 if cpu_count > 1 else 1))
-    total_score = 0.0
+    
+    results_dict = {i: [] for i in range(N)}
+    avg_topk_score = 0.0
     success_cnt = 0
     error_messages = []
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
         futures = [executor.submit(run_tmalign, task) for task in tasks]
-        for future in tqdm(
-            as_completed(futures),
-            total=len(futures),
-            desc="TM-align",
-            leave=False,
-        ):
+        for future in tqdm(as_completed(futures), total=len(futures), desc="TM-align", leave=False,):
             try:
-                score = future.result()
-                total_score += score
+                q_idx, c_idx, score = future.result()
+                results_dict[q_idx].append({'c_idx': c_idx, 'score': score})
+                avg_topk_score += score
                 success_cnt += 1
             except Exception as e:
                 error_messages.append(str(e))
     if success_cnt == 0:
-        raise RuntimeError(
-            "All TM-align tasks failed.\n"
-            + ("\n\nFirst error:\n" + error_messages[0] if error_messages else "")
-        )
+        raise RuntimeError("All TM-align tasks failed.\n" + ("\n\nFirst error:\n" + error_messages[0] if error_messages else ""))
     if error_messages:
-        print(f"[Warning] {len(error_messages)} TM-align tasks failed.")
-        print(f"[Warning] First error:\n{error_messages[0]}")
-    return total_score / success_cnt
+        print(f"[Warning] {len(error_messages)} TM-align tasks failed. First error:\n{error_messages[0]}")
+    avg_topk_score /= success_cnt
+
+    sorted_results = {}
+    avg_top1_score = 0.0
+    valid_queries = 0
+    for q_idx in range(N):
+        c_list = results_dict[q_idx]
+        c_list.sort(key=lambda x: x['score'], reverse=True)
+        sorted_results[q_idx] = c_list
+        if len(c_list) > 0:
+            avg_top1_score += c_list[0]['score']
+            valid_queries += 1
+    if valid_queries > 0:
+        avg_top1_score /= valid_queries
+    
+    return sorted_results, avg_top1_score, avg_topk_score
 
 
 def save_model(model:nn.Module, model_name:str, epoch:int):
