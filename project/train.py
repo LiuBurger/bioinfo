@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from torch.utils.data import DataLoader
 from sklearn.model_selection import train_test_split
 
-from utils.data import ProteinDataset, QueryHomologyDataset, query_homo_collate_fun, collate_fun_emb
+from utils.data import ProteinDataset, QueryHomologyDataset, collate_fun_train, collate_fun_emb
 from utils.model import DualEncoderRetriever
 from utils.tools import gen_embeddings, build_idx, calculate_remote_homology_score, save_model
 
@@ -14,7 +14,8 @@ from utils.tools import gen_embeddings, build_idx, calculate_remote_homology_sco
 @dataclass
 class TrainConfig:
     epochs: int = 10
-    gpu: int = 6  
+    gpu: int = 8  
+    test_gpu: int = 9
     batch_size: int = 128
     num_workers: int = 6
     model_name: str = "dual_encoder"
@@ -48,7 +49,6 @@ class ContrastiveTrainer:
                 self.log_file.write(f"\nEpoch {epoch + 1} Training\n")
                 train_loss = []
                 self.model.train()
-                
                 for i, batch in enumerate(tqdm(train_loader, unit="batch")):
                     # 解析 collate_fn 传回来的 Dict，将其扔到 GPU
                     batch_gpu = {}
@@ -60,31 +60,25 @@ class ContrastiveTrainer:
 
                     output = self.model(batch_gpu)
                     loss = output["loss"]
-                    
                     self.optimizer.zero_grad()
                     loss.backward()
                     self.optimizer.step()
                     train_loss.append(loss.item())
-                    
-                    if (i + 1) % 500 == 0:
+                    if (i + 1) % 100 == 0:
                         avg_loss = float(pt.tensor(train_loss).mean())
                         msg = f"Epoch [{epoch + 1}/{self.config.epochs}], Step [{i+1}], Train Loss: {avg_loss:.4f}"
                         print(msg)
                         self.log_file.write(msg + "\n")
                         train_loss = []
-
                 self.scheduler.step()
                 print(f"======================= Test epoch {epoch + 1} =======================")
                 self.log_file.write(f"\nEpoch {epoch + 1} Testing\n")
                 pt.cuda.empty_cache()
-                self.model.eval()
-                
-                with pt.no_grad():
-                    embs_lib = gen_embeddings(self.model, lib_loader, self.config.gpu, mode='lib')
-                    embs_test = gen_embeddings(self.model, test_loader, self.config.gpu, mode='query')
-                    
-                I, _ = build_idx(embs_lib, embs_test, self.config.gpu, topk=self.config.topk)
-                
+                # self.model.to(self.config.test_gpu)
+                embs_lib = gen_embeddings(self.model, lib_loader, self.config.gpu, mode='lib')
+                embs_test = gen_embeddings(self.model, test_loader, self.config.gpu, mode='query')       
+                # self.model.to(self.config.gpu)
+                I, _ = build_idx(embs_lib, embs_test)
                 sorted_results, avg_top1_score, avg_topk_score = calculate_remote_homology_score(
                     query=test_set, database=datalib, idx=I,
                     k=self.config.topk,
@@ -98,7 +92,6 @@ class ContrastiveTrainer:
                         Average Top-{self.config.topk} Remote homologous score: {avg_topk_score:.6f}"
                 print(msg)
                 self.log_file.write(msg + "\n")
-                
                 if avg_top1_score > self.max_top1 or avg_topk_score > self.max_topk:
                     self.max_top1 = avg_top1_score
                     self.max_topk = avg_topk_score
@@ -112,8 +105,14 @@ class ContrastiveTrainer:
 if __name__ == "__main__":
     config = TrainConfig()
     pt.cuda.set_device(config.gpu)
-
-    # 1. 加载数据
+    """# 1. 加载数据
+    datalib(ProteinDataset)->libloader(shuffle=False)
+        |->query_homo_data(QueryHomologyDataset)
+        |       |->train_loader(shuffle=True)
+        |
+        |->test_set(ProteinDataset)
+                |->test_loader(shuffle=False)
+    """
     print('loading data')
     # (seq_list, graph_list, lab_list)
     data = pt.load(f'./data/pbond0_hbond0.pt', weights_only=False)
@@ -125,24 +124,23 @@ if __name__ == "__main__":
     query_homo_data = QueryHomologyDataset(datalib, './data/tmalign.out', pdb2idx)
     
     batch_size = config.batch_size
-    libloader = DataLoader(datalib, batch_size=batch_size, shuffle=False, 
-                           collate_fn=collate_fun_emb(mode='lib'), num_workers=config.num_workers)
+    libloader = DataLoader(datalib, batch_size=batch_size//4, shuffle=False, num_workers=config.num_workers,
+                           collate_fn=collate_fun_emb(mode='lib'), drop_last=False)
                            
     _, test_map = train_test_split(lib_map, test_size=1024, random_state=42)
     test_set = ProteinDataset(datalib, test_map)
     
-    # 修复：collate_fun 需要传入 protein_dataset 实例进行初始化
-    train_collate_fn = query_homo_collate_fun(datalib, positive_strategy="weighted")
+    # collate_fun 需要传入 protein_dataset 实例进行初始化
     train_loader = DataLoader(query_homo_data, batch_size=batch_size, shuffle=True, num_workers=config.num_workers,
-                              collate_fn=train_collate_fn, drop_last=True)
+                              collate_fn=collate_fun_train(datalib), drop_last=True)
                               
-    test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, num_workers=config.num_workers,
+    test_loader = DataLoader(test_set, batch_size=batch_size//4, shuffle=False, num_workers=config.num_workers,
                              collate_fn=collate_fun_emb('query'), drop_last=False)
 
     # 2. 初始化模型。请根据你的数据集实际维度修改 vocab_size, node_feat_dim 和 edge_feat_dim 
     model = DualEncoderRetriever(
         vocab_size=21,          # 氨基酸种类+1
-        node_feat_dim=10,      # 见特征工程
+        node_feat_dim=data[1][0].x.shape[1],      # 见特征工程
         edge_feat_dim=data[1][0].edge_attr.shape[1], # graph_list的第0个
     ).cuda(config.gpu)
 

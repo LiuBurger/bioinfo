@@ -104,10 +104,7 @@ class QueryHomologyDataset(Dataset):
         return len(self.map)
 
 
-def query_homo_collate_fun(
-    protein_dataset,
-    positive_strategy: str = "weighted",   # "top1" / "random" / "weighted"
-):
+def collate_fun_train(protein_dataset, positive_strategy: str = "weighted",):
     assert positive_strategy in ["top1", "random", "weighted"]
     def collate_fun(batch):
         query_seqs = []
@@ -168,7 +165,7 @@ def query_homo_collate_fun(
 
 def collate_fun_emb(mode:str='lib'):
     def collate_fun(batch):
-        seqs_pad, masks, graphs = [], []
+        seqs_pad, masks, graphs = [], [], []
         max_len = max(len(seq) for seq, _, _ in batch)
         for seq, graph, _ in batch: # seq, graph, lab
             pad_len = max_len - len(seq)

@@ -27,8 +27,7 @@ class SequenceEncoder(nn.Module):
         vocab_size: int,
         d_model: int = 256,
         nhead: int = 8,
-        num_layers: int = 4,
-        dim_feedforward: int = 512,
+        num_layers: int = 1,
         dropout: float = 0.1,
         max_len: int = 4096,
     ):
@@ -38,7 +37,7 @@ class SequenceEncoder(nn.Module):
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
-            dim_feedforward=dim_feedforward,
+            dim_feedforward=2*d_model,
             dropout=dropout,
             batch_first=True,
             activation="gelu",
@@ -50,37 +49,25 @@ class SequenceEncoder(nn.Module):
     def forward(self, input_ids, attention_mask):
         x = self.token_embedding(input_ids)
         x = self.pos_embedding(x)
-        key_padding_mask = attention_mask == 0
+        key_padding_mask = (attention_mask == 0)
         x = self.encoder(x, src_key_padding_mask=key_padding_mask)
         x = self.norm(x)
         mask = attention_mask.unsqueeze(-1).float()
         pooled = (x * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
         return pooled
 
-    def forward_tokens(self, input_ids, attention_mask):
-        """
-        返回 token-level 表示，给 GraphEncoder 用
-        """
-        x = self.token_embedding(input_ids)
-        x = self.pos_embedding(x)
-        key_padding_mask = (attention_mask == 0)
-        x = self.encoder(x, src_key_padding_mask=key_padding_mask)
-        x = self.norm(x)
-        return x  # [B, L, D]
-
 
 class GINEBackbone(nn.Module):
     def __init__(
         self,
-        in_dim: int,
         hidden_dim: int,
         edge_dim: int,
         num_layers: int = 3,
         dropout: float = 0.1,
     ):
         super().__init__()
+        self.edge_dim = edge_dim
         self.dropout = dropout
-        self.node_in_proj = nn.Linear(in_dim, hidden_dim)
         self.edge_encoder = (
             nn.Linear(edge_dim, hidden_dim) if edge_dim != hidden_dim else nn.Identity()
         )
@@ -89,8 +76,6 @@ class GINEBackbone(nn.Module):
 
         for _ in range(num_layers):
             mlp = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.ReLU(),
                 nn.Linear(hidden_dim, hidden_dim),
             )
             conv = gnn.GINEConv(nn=mlp, train_eps=True, edge_dim=hidden_dim)
@@ -105,11 +90,10 @@ class GINEBackbone(nn.Module):
         """
         if edge_attr is None:
             edge_attr = x.new_zeros(edge_idx.size(1), self.edge_dim)
-        x = self.node_in_proj(x)
         edge_attr = self.edge_encoder(edge_attr)
         for conv, norm in zip(self.convs, self.norms):
             h = conv(x, edge_idx, edge_attr)
-            h = F.relu(h)
+            h = F.silu(h)
             h = F.dropout(h, p=self.dropout, training=self.training)
             x = norm(x + h)  # residual
         return x
@@ -121,34 +105,20 @@ class GraphEncoder(nn.Module):
         vocab_size: int,
         node_feat_dim: int,
         edge_feat_dim: int,
-        seq_d_model: int = 256,
-        seq_nhead: int = 8,
-        seq_num_layers: int = 2,
-        seq_ffn_dim: int = 512,
-        gnn_hidden_dim: int = 256,
+        gnn_dim: int = 256,
         gnn_num_layers: int = 3,
-        proj_dim: int = 256,
         dropout: float = 0.1,
     ):
         super().__init__()
-        # candidate sequence encoder
-        self.seq_encoder = SequenceEncoder(
-            vocab_size=vocab_size,
-            d_model=seq_d_model,
-            nhead=seq_nhead,
-            num_layers=seq_num_layers,
-            dim_feedforward=seq_ffn_dim,
-            dropout=dropout,
-        )
-        gnn_input_dim = seq_d_model + node_feat_dim
+        # 为了确保后续在gnn中维度整齐
+        self.seq_encoder = nn.Embedding(num_embeddings=vocab_size, 
+                                        embedding_dim=gnn_dim-node_feat_dim, padding_idx=0)
         self.gnn = GINEBackbone(
-            in_dim=gnn_input_dim,
-            hidden_dim=gnn_hidden_dim,
+            hidden_dim=gnn_dim,
             edge_dim=edge_feat_dim,
             num_layers=gnn_num_layers,
             dropout=dropout,
         )
-        self.out_proj = nn.Linear(gnn_hidden_dim, proj_dim)
 
     def forward(self, seq, mask, graph):
         """
@@ -166,11 +136,12 @@ class GraphEncoder(nn.Module):
         edge_attr = graph.edge_attr.float()
         batch = graph.batch
         node2seq = graph.node2seq.long()
+        # [B, L, D]
+        emb = self.seq_encoder(seq)
+        emb = emb * mask.unsqueeze(-1).float()
+        B, L, D = emb.shape
         if node2seq.min() < 0 or node2seq.max() >= L:
             raise ValueError(f"node2seq out of range: min={node2seq.min().item()}, max={node2seq.max().item()}, L={L}")
-        # [B, L, D]
-        emb = self.seq_encoder.forward_tokens(seq, mask)
-        B, L, D = emb.shape
         emb_flat = emb.reshape(B * L, D)
         # 第 k 个节点对应到 batch[k] 这个图里的 node2seq[k] 位置
         flat_idx = batch * L + node2seq
@@ -179,7 +150,6 @@ class GraphEncoder(nn.Module):
         x = pt.cat([node_emb, x], dim=-1)  # [N, D + Fx]
         x = self.gnn(x, edge_idx, edge_attr=edge_attr, batch=batch)
         x = gnn.global_mean_pool(x, batch)  # [B, hidden_dim]
-        x = self.out_proj(x)
         return x
 
 
@@ -191,12 +161,9 @@ class DualEncoderRetriever(nn.Module):
         edge_feat_dim: int,
         query_d_model: int = 256,
         query_nhead: int = 8,
-        query_num_layers: int = 4,
-        query_ffn_dim: int = 512,
-        cand_seq_num_layers: int = 2,
-        gnn_hidden_dim: int = 256,
-        gnn_num_layers: int = 3,
-        proj_dim: int = 256,
+        query_num_layers: int = 1,
+        gnn_dim: int = 256,
+        gnn_num_layers: int = 1,
         dropout: float = 0.1,
         temperature: float = 0.07,
         normalize: bool = True,
@@ -208,30 +175,22 @@ class DualEncoderRetriever(nn.Module):
             d_model=query_d_model,
             nhead=query_nhead,
             num_layers=query_num_layers,
-            dim_feedforward=query_ffn_dim,
             dropout=dropout,
         )
         self.candidate_encoder = GraphEncoder(
             vocab_size=vocab_size,
             node_feat_dim=node_feat_dim,
             edge_feat_dim=edge_feat_dim,
-            seq_d_model=query_d_model,
-            seq_nhead=query_nhead,
-            seq_num_layers=cand_seq_num_layers,
-            seq_ffn_dim=query_ffn_dim,
-            gnn_hidden_dim=gnn_hidden_dim,
+            gnn_dim=gnn_dim,
             gnn_num_layers=gnn_num_layers,
-            proj_dim=proj_dim,
             dropout=dropout,
         )
-        self.query_proj = nn.Linear(query_d_model, proj_dim)
         self.temperature = temperature
         self.normalize = normalize
         self.symmetric_loss = symmetric_loss
 
     def encode_query(self, query_ids, query_mask):
         q = self.query_encoder(query_ids, query_mask)
-        q = self.query_proj(q)
         if self.normalize:
             q = F.normalize(q, p=2, dim=-1)
         return q

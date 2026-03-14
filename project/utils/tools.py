@@ -15,18 +15,20 @@ from torch.utils.data import DataLoader
 
 def gen_embeddings(model:nn.Module, loader:DataLoader, gpu:int, mode:str='lib'):
     embs = []
-    if mode == 'lib':
-        for seq_pad, masks, graphs in loader:
-            data = [d.to(gpu) for d in (seq_pad, masks, graphs)]
-            emb = model.encode(tuple(data), mode).detach().cpu().numpy()
-            embs.append(emb)
-    elif mode == 'query':
-        for seq_pad, masks in loader:
-            data = [d.to(gpu) for d in (seq_pad, masks)]
-            emb = model.encode(tuple(data), mode).detach().cpu().numpy()
-            embs.append(emb)
-    else:
-        raise ValueError(f"mode '{mode}' not exist")
+    model.eval()
+    with pt.no_grad():
+        if mode == 'lib':
+            for seq_pad, masks, graphs in loader:
+                data = [d.to(gpu) for d in (seq_pad, masks, graphs)]
+                emb = model.encode(tuple(data), mode).detach().cpu().numpy()
+                embs.append(emb)
+        elif mode == 'query':
+            for seq_pad, masks in loader:
+                data = [d.to(gpu) for d in (seq_pad, masks)]
+                emb = model.encode(tuple(data), mode).detach().cpu().numpy()
+                embs.append(emb)
+        else:
+            raise ValueError(f"mode '{mode}' not exist")
     pt.cuda.empty_cache()
     embs = np.concatenate(embs, axis=0)
     embs /= np.linalg.norm(embs, axis=1, keepdims=True)
@@ -41,21 +43,17 @@ def faiss_idx(embs_lib:np.ndarray, gpu:int):
     return index_flat
 
 
-def build_idx(embs_lib:np.ndarray, embs_test:np.ndarray, gpu:int, topk:int=200, keep_index:bool=False):
+def build_idx(embs_lib:np.ndarray, embs_test:np.ndarray, topk:int=200, keep_index:bool=False):
     assert embs_lib.shape[1] == embs_test.shape[1], 'Dimension not match'
-    res = faiss.StandardGpuResources()
     index_flat = faiss.IndexFlatL2(embs_lib.shape[1])
-    index_flat = faiss.index_cpu_to_gpu(res, gpu, index_flat)
-    index_flat.add(embs_lib)
+    index_flat.add(embs_lib.astype('float32'))
     time_start = datetime.now()
-    Distance, I = index_flat.search(embs_test, topk)
-    print('faiss searching time: ', datetime.now()-time_start)
+    Distance, I = index_flat.search(embs_test.astype('float32'), topk)
+    print('faiss cpu searching time: ', datetime.now()-time_start)
     pt.cuda.empty_cache()
-    if keep_index:
-        return I, Distance, index_flat
-    else:
+    if not keep_index:
         index_flat.reset()
-        return I, Distance
+    return I, Distance
 
 
 def make_pdb_path(pdb_root, pdb_name: str) -> Path:
