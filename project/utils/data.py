@@ -2,10 +2,8 @@ import h5py
 import random
 import torch as pt
 import numpy as np
-from torch_geometric.data import Batch
 from torch.utils.data import Dataset
 import pandas as pd
-import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 
 
@@ -39,14 +37,12 @@ class ProteinDataset(Dataset):
         super().__init__()
         if isinstance(dataset, tuple): # raw data
             self.seq = dataset[0]           
-            self.graph = dataset[1]
-            self.lab = dataset[2]
+            self.lab = dataset[1]
             self.map = np.arange(len(self.lab), dtype=np.int64) # 恒等映射 
-            assert len(self.seq) == len(self.graph) == len(self.lab)
+            assert len(self.seq) == len(self.lab)
         else: # structured data
             assert mapping is not None, "Mapping must be provided for structured data."
             self.seq = dataset.seq
-            self.graph = dataset.graph
             self.lab = dataset.lab
             self.map = mapping
             assert np.max(self.map) < len(self.lab)
@@ -54,8 +50,8 @@ class ProteinDataset(Dataset):
 
     def __getitem__(self, idx):
         idx = self.map[idx]
-        seq, graph, lab = self.seq[idx], self.graph[idx], self.lab[idx]
-        return seq, graph, lab
+        seq, lab = self.seq[idx], self.lab[idx]
+        return seq, lab
 
     def __len__(self):  
         return len(self.map) #子集的大小是map的大小
@@ -104,12 +100,11 @@ class QueryHomologyDataset(Dataset):
         return len(self.map)
 
 
-def collate_fun_train(protein_dataset, positive_strategy: str = "weighted",):
+def collate_fun_train(protein_dataset, positive_strategy: str = "random",):
     assert positive_strategy in ["top1", "random", "weighted"]
     def collate_fun(batch):
         query_seqs = []
         cand_seqs = []
-        cand_graphs = []
         q_indices = []
         c_indices = []
         pos_score = []
@@ -131,12 +126,10 @@ def collate_fun_train(protein_dataset, positive_strategy: str = "weighted",):
                     pos_j = random.randint(0, len(idx2_list) - 1)
 
             idx2 = idx2_list[pos_j]
-            # ProteinDataset(mode='graph') -> (seq, graph, lab)
-            q_seq, _, _ = protein_dataset[idx1]
-            c_seq, c_graph, _ = protein_dataset[idx2]
+            q_seq, _ = protein_dataset[idx1]
+            c_seq, _ = protein_dataset[idx2]
             query_seqs.append(q_seq)
             cand_seqs.append(c_seq)
-            cand_graphs.append(c_graph)
             q_indices.append(idx1)
             c_indices.append(idx2)
             pos_score.append(score_list[pos_j].float())
@@ -144,18 +137,16 @@ def collate_fun_train(protein_dataset, positive_strategy: str = "weighted",):
         if len(query_seqs) == 0:
             raise RuntimeError("Empty batch after positive pair selection.")
 
-        query_ids = pad_sequence(query_seqs, batch_first=True, padding_value=0)
+        query_ids = pad_sequence(query_seqs, batch_first=True)
         query_mask = (query_ids != 0).long()
-        cand_ids = pad_sequence(cand_seqs, batch_first=True, padding_value=0)
+        cand_ids = pad_sequence(cand_seqs, batch_first=True)
         cand_mask = (cand_ids != 0).long()
-        cand_graph_batch = Batch.from_data_list(cand_graphs)
 
         return {
             "query_ids": query_ids,
             "query_mask": query_mask,
             "cand_ids": cand_ids,
             "cand_mask": cand_mask,
-            "candidate_graph": cand_graph_batch,
             "q_idx": pt.tensor(q_indices, dtype=pt.long),
             "c_idx": pt.tensor(c_indices, dtype=pt.long),
             "score": pt.stack(pos_score),
@@ -163,22 +154,11 @@ def collate_fun_train(protein_dataset, positive_strategy: str = "weighted",):
     return collate_fun
 
 
-def collate_fun_emb(mode:str='lib'):
-    def collate_fun(batch):
-        seqs_pad, masks, graphs = [], [], []
-        max_len = max(len(seq) for seq, _, _ in batch)
-        for seq, graph, _ in batch: # seq, graph, lab
-            pad_len = max_len - len(seq)
-            seqs_pad.append(F.pad(seq, (0, pad_len), value=0))
-            masks.append(F.pad(pt.ones(len(seq), dtype=pt.bool), (0, pad_len), value=False))
-            graphs.append(graph)
-        seqs_pad = pt.stack(seqs_pad, dim=0)
-        masks = pt.stack(masks, dim=0)
-        graphs = Batch.from_data_list(graphs)
-        if mode == 'lib':
-            return seqs_pad, masks, graphs
-        elif mode == 'query':
-            return seqs_pad, masks
-        else:
-            raise ValueError(f"mode '{mode}' not exist")
-    return collate_fun
+
+def collate_fun_emb(batch):
+    seqs_pad = []
+    for seq, _ in batch: # seq, graph, lab
+        seqs_pad.append(seq)
+    seqs_pad = pad_sequence(seqs_pad, batch_first=True)
+    masks = (seqs_pad != 0).long()
+    return seqs_pad, masks

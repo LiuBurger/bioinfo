@@ -2,11 +2,10 @@ import math
 import torch as pt
 import torch.nn as nn
 import torch.nn.functional as F
-import torch_geometric.nn as gnn
 
 
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model: int, max_len: int = 4096):
+    def __init__(self, d_model: int, max_len: int = 2048):
         super().__init__()
         pe = pt.zeros(max_len, d_model)
         position = pt.arange(0, max_len, dtype=pt.float).unsqueeze(1)
@@ -29,7 +28,7 @@ class SequenceEncoder(nn.Module):
         nhead: int = 8,
         num_layers: int = 1,
         dropout: float = 0.1,
-        max_len: int = 4096,
+        max_len: int = 1300,
     ):
         super().__init__()
         self.token_embedding = nn.Embedding(vocab_size, d_model, padding_idx=0)
@@ -57,159 +56,48 @@ class SequenceEncoder(nn.Module):
         return pooled
 
 
-class GINEBackbone(nn.Module):
-    def __init__(
-        self,
-        hidden_dim: int,
-        edge_dim: int,
-        num_layers: int = 3,
-        dropout: float = 0.1,
-    ):
-        super().__init__()
-        self.edge_dim = edge_dim
-        self.dropout = dropout
-        self.edge_encoder = (
-            nn.Linear(edge_dim, hidden_dim) if edge_dim != hidden_dim else nn.Identity()
-        )
-        self.convs = nn.ModuleList()
-        self.norms = nn.ModuleList()
-
-        for _ in range(num_layers):
-            mlp = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
-            )
-            conv = gnn.GINEConv(nn=mlp, train_eps=True, edge_dim=hidden_dim)
-            self.convs.append(conv)
-            self.norms.append(nn.LayerNorm(hidden_dim))
-
-    def forward(self, x, edge_idx, edge_attr=None, batch=None):
-        """
-        x: [N, in_dim]
-        edge_idx: [2, E]
-        edge_attr: [E, edge_dim]
-        """
-        if edge_attr is None:
-            edge_attr = x.new_zeros(edge_idx.size(1), self.edge_dim)
-        edge_attr = self.edge_encoder(edge_attr)
-        for conv, norm in zip(self.convs, self.norms):
-            h = conv(x, edge_idx, edge_attr)
-            h = F.silu(h)
-            h = F.dropout(h, p=self.dropout, training=self.training)
-            x = norm(x + h)  # residual
-        return x
-
-
-class GraphEncoder(nn.Module):
-    def __init__(
-        self,
-        vocab_size: int,
-        node_feat_dim: int,
-        edge_feat_dim: int,
-        gnn_dim: int = 256,
-        gnn_num_layers: int = 3,
-        dropout: float = 0.1,
-    ):
-        super().__init__()
-        # 为了确保后续在gnn中维度整齐
-        self.seq_encoder = nn.Embedding(num_embeddings=vocab_size, 
-                                        embedding_dim=gnn_dim-node_feat_dim, padding_idx=0)
-        self.gnn = GINEBackbone(
-            hidden_dim=gnn_dim,
-            edge_dim=edge_feat_dim,
-            num_layers=gnn_num_layers,
-            dropout=dropout,
-        )
-
-    def forward(self, seq, mask, graph):
-        """
-        seq: [B, L]
-        mask: [B, L]
-        graph:
-          - x: [N, Fx]
-          - edge_index: [2, E]
-          - edge_attr: [E, Fe]
-          - batch: [N]
-          - node2seq: [N]
-        """
-        x = graph.x.float()
-        edge_idx = graph.edge_index
-        edge_attr = graph.edge_attr.float()
-        batch = graph.batch
-        node2seq = graph.node2seq.long()
-        # [B, L, D]
-        emb = self.seq_encoder(seq)
-        emb = emb * mask.unsqueeze(-1).float()
-        B, L, D = emb.shape
-        if node2seq.min() < 0 or node2seq.max() >= L:
-            raise ValueError(f"node2seq out of range: min={node2seq.min().item()}, max={node2seq.max().item()}, L={L}")
-        emb_flat = emb.reshape(B * L, D)
-        # 第 k 个节点对应到 batch[k] 这个图里的 node2seq[k] 位置
-        flat_idx = batch * L + node2seq
-        node_emb = emb_flat[flat_idx]  # [N, D]
-        # 拼接节点属性
-        x = pt.cat([node_emb, x], dim=-1)  # [N, D + Fx]
-        x = self.gnn(x, edge_idx, edge_attr=edge_attr, batch=batch)
-        x = gnn.global_mean_pool(x, batch)  # [B, hidden_dim]
-        return x
-
-
 class DualEncoderRetriever(nn.Module):
     def __init__(
         self,
         vocab_size: int,
-        node_feat_dim: int,
-        edge_feat_dim: int,
-        query_d_model: int = 256,
-        query_nhead: int = 8,
-        query_num_layers: int = 1,
-        gnn_dim: int = 256,
-        gnn_num_layers: int = 1,
+        d_model: int = 256,
+        nhead: int = 8,
+        num_layers: int = 2,
         dropout: float = 0.1,
-        temperature: float = 0.07,
+        temperature: float = 0.1,
         normalize: bool = True,
         symmetric_loss: bool = True,
     ):
         super().__init__()
         self.query_encoder = SequenceEncoder(
             vocab_size=vocab_size,
-            d_model=query_d_model,
-            nhead=query_nhead,
-            num_layers=query_num_layers,
+            d_model=d_model,
+            nhead=nhead,
+            num_layers=num_layers,
             dropout=dropout,
         )
-        self.candidate_encoder = GraphEncoder(
+        self.candidate_encoder = SequenceEncoder(
             vocab_size=vocab_size,
-            node_feat_dim=node_feat_dim,
-            edge_feat_dim=edge_feat_dim,
-            gnn_dim=gnn_dim,
-            gnn_num_layers=gnn_num_layers,
+            d_model=d_model,
+            nhead=nhead,
+            num_layers=num_layers,
             dropout=dropout,
         )
         self.temperature = temperature
         self.normalize = normalize
-        self.symmetric_loss = symmetric_loss
-
-    def encode_query(self, query_ids, query_mask):
-        q = self.query_encoder(query_ids, query_mask)
-        if self.normalize:
-            q = F.normalize(q, p=2, dim=-1)
-        return q
-
-    def encode_candidate(self, cand_ids, cand_mask, candidate_graph):
-        c = self.candidate_encoder(cand_ids, cand_mask, candidate_graph)
-        if self.normalize:
-            c = F.normalize(c, p=2, dim=-1)
-        return c
+        self.symmetric_loss = symmetric_loss        
     
-    def encode(self, data, mode:str='lib'):
-        if mode == 'lib':
-            cand_ids, cand_mask, candidate_graph = data
-            return self.encode_candidate(cand_ids, cand_mask, candidate_graph)
-        elif mode == 'query':
-            query_ids, query_mask = data
-            return self.encode_query(query_ids, query_mask)
+    def encode(self, data, mode:str='query'):
+        ids, masks = data
+        if mode == 'query':
+            emb = self.query_encoder(ids, masks)
+        elif mode == 'candidate':
+            emb = self.candidate_encoder(ids, masks)
         else:
             raise ValueError(f"mode '{mode}' not exist")
+        if self.normalize:
+            emb = F.normalize(emb, p=2, dim=-1)
+        return emb
 
     def forward(self, batch):
         """
@@ -230,9 +118,8 @@ class DualEncoderRetriever(nn.Module):
         query_mask = batch["query_mask"]
         cand_ids = batch["cand_ids"]
         cand_mask = batch["cand_mask"]
-        candidate_graph = batch["candidate_graph"]
-        q_emb = self.encode_query(query_ids, query_mask)  # [B, D]
-        c_emb = self.encode_candidate(cand_ids, cand_mask, candidate_graph)  # [B, D]
+        q_emb = self.query_encoder(query_ids, query_mask)  # [B, D]
+        c_emb = self.candidate_encoder(cand_ids, cand_mask)  # [B, D]
         """
         相似度计算,logits[i, j]表示：第 i 个 query 和第 j 个 candidate 的相似度
         temperature 是对 softmax 的“锐化系数”

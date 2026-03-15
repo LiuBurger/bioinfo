@@ -13,22 +13,14 @@ from torch.utils.data import DataLoader
 
 
 
-def gen_embeddings(model:nn.Module, loader:DataLoader, gpu:int, mode:str='lib'):
+def gen_embeddings(model:nn.Module, loader:DataLoader, gpu:int, mode:str='candidate'):
     embs = []
     model.eval()
     with pt.no_grad():
-        if mode == 'lib':
-            for seq_pad, masks, graphs in loader:
-                data = [d.to(gpu) for d in (seq_pad, masks, graphs)]
-                emb = model.encode(tuple(data), mode).detach().cpu().numpy()
-                embs.append(emb)
-        elif mode == 'query':
-            for seq_pad, masks in loader:
-                data = [d.to(gpu) for d in (seq_pad, masks)]
-                emb = model.encode(tuple(data), mode).detach().cpu().numpy()
-                embs.append(emb)
-        else:
-            raise ValueError(f"mode '{mode}' not exist")
+        for seq_pad, masks in loader:
+            data = [d.to(gpu, non_blocking=True) for d in (seq_pad, masks)]
+            emb = model.encode(tuple(data), mode).detach().cpu().numpy()
+            embs.append(emb)
     pt.cuda.empty_cache()
     embs = np.concatenate(embs, axis=0)
     embs /= np.linalg.norm(embs, axis=1, keepdims=True)
