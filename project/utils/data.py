@@ -5,6 +5,7 @@ import numpy as np
 from torch.utils.data import Dataset
 import pandas as pd
 from torch.nn.utils.rnn import pad_sequence
+from torch_geometric.data import Batch
 
 
 def load(fn, mode:str='all'):
@@ -33,25 +34,33 @@ def load(fn, mode:str='all'):
 
 
 class ProteinDataset(Dataset):
-    def __init__(self, dataset, mapping:np.ndarray=None):
+    def __init__(self, dataset, mapping:np.ndarray=None, mode:str='query'):
         super().__init__()
+        self.mode = mode
         if isinstance(dataset, tuple): # raw data
             self.seq = dataset[0]
             self.lab = dataset[1]
+            if mode == 'cand':
+                self.graph = dataset[2]
             self.map = np.arange(len(self.lab), dtype=np.int64) # 恒等映射
             assert len(self.seq) == len(self.lab)
         else: # structured data
             assert mapping is not None, "Mapping must be provided for structured data."
             self.seq = dataset.seq
             self.lab = dataset.lab
+            if mode == 'cand':
+                self.graph = dataset.graph
             self.map = mapping
             assert np.max(self.map) < len(self.lab)
     # self.map旨在维护一个data子集的映射，数据仍然是全部数据
 
     def __getitem__(self, idx):
         idx = self.map[idx]
-        seq, lab = self.seq[idx], self.lab[idx]
-        return seq, lab
+        data = {}
+        data['seq'], data['lab'] = self.seq[idx], self.lab[idx]
+        if self.mode == 'cand':
+            data["graph"] = self.graph[idx]
+        return data
 
     def __len__(self):
         return len(self.map) #子集的大小是map的大小
@@ -78,21 +87,22 @@ class QueryHomologyDataset(Dataset):
                 g = g.sort_values('score', ascending=False, kind='mergesort')
                 grouped.append({
                     'idx1': int(idx1),
-                    'idx2': g['idx2'].to_numpy(dtype=np.int64).tolist(),
-                    'score': pt.from_numpy(g['score'].to_numpy(dtype=np.float32)),
+                    'idx2_list': g['idx2'].to_numpy(dtype=np.int64).tolist(),
+                    'score_list': pt.from_numpy(g['score'].to_numpy(dtype=np.float32)),
                 })
             self.groups = grouped
             self.map = np.arange(len(self.groups), dtype=np.int64) if mapping is None else mapping.astype(np.int64)
         else: # structured data
-            assert hasattr(dataset, 'groups'),                 "For structured data, dataset must already contain grouped data in `dataset.groups`."
+            assert hasattr(dataset, 'groups'), "For structured data, dataset must already contain grouped data in `dataset.groups`."
             self.groups = dataset.groups
             self.map = mapping.astype(np.int64) if mapping is not None else np.arange(len(self.groups), dtype=np.int64)
             assert np.max(self.map) < len(self.groups), "mapping index out of range."
 
     def __getitem__(self, idx):
         g = self.groups[self.map[idx]]
-        #          0           1        2
-        return g['idx1'], g['idx2'], g['score']
+        data = {}
+        data['idx1'], data['idx2_list'], data['score_list'] = g['idx1'], g['idx2_list'], g['score_list']
+        return data
 
     def __len__(self):
         return len(self.map)
@@ -106,9 +116,10 @@ def collate_fun_train(protein_dataset, mode:str='weight', top_m:int=16, temperat
         score_list : tensor
     """
     def collate_fn(batch):
-        query_seqs, cand_seqs, scores = [], [], []
-        for idx1, idx2_list, score_list in batch:
-            q_seq, _ = protein_dataset[idx1]
+        query_seqs, cand_seqs, cand_graphs, scores = [], [], [], []
+        for data in batch:
+            idx1, idx2_list, score_list = data['idx1'], data['idx2_list'], data['score_list']
+            q_seq = protein_dataset[idx1]['seq']
             query_seqs.append(q_seq)
 
             m = min(top_m, len(idx2_list)) if top_m is not None else len(idx2_list)
@@ -130,30 +141,54 @@ def collate_fun_train(protein_dataset, mode:str='weight', top_m:int=16, temperat
             score = float(score_list[idx2_idx])
             scores.append(score)
             cand_idx = int(idx2_list[idx2_idx])
-            c_seq, _ = protein_dataset[cand_idx]
+            c_seq = protein_dataset[cand_idx]['seq']
             cand_seqs.append(c_seq)
+            c_graph = protein_dataset[cand_idx]['graph']
+            cand_graphs.append(c_graph)
 
         query_seqs = pad_sequence(query_seqs, batch_first=True)
         cand_seqs = pad_sequence(cand_seqs, batch_first=True)
         query_mask = (query_seqs != 0).long()
         cand_mask = (cand_seqs != 0).long()
+        cand_graphs = Batch.from_data_list(cand_graphs)
         scores = pt.tensor(scores, dtype=pt.float32)
         return {
             "query_seqs": query_seqs,
-            "query_mask": query_mask,
+            "query_masks": query_mask,
             "cand_seqs": cand_seqs,
-            "cand_mask": cand_mask,
+            "cand_masks": cand_mask,
+            "cand_graphs": cand_graphs,
             "scores": scores,
         }
 
     return collate_fn
 
 
+# def collate_fun_emb(batch):
+#     seqs_pad = []
+#     for seq, _ in batch: # seq, graph, lab
+#         seqs_pad.append(seq)
+#     seqs_pad = pad_sequence(seqs_pad, batch_first=True)
+#     masks = (seqs_pad != 0).long()
+#     return seqs_pad, masks
 
-def collate_fun_emb(batch):
-    seqs_pad = []
-    for seq, _ in batch: # seq, graph, lab
-        seqs_pad.append(seq)
-    seqs_pad = pad_sequence(seqs_pad, batch_first=True)
-    masks = (seqs_pad != 0).long()
-    return seqs_pad, masks
+
+def collate_fun_emb(mode:str='query'):
+    def collate_fun(batch):
+        seqs_pad = []
+        data = {}
+        for b in batch:
+            seqs_pad.append(b['seq'])
+        seqs_pad = pad_sequence(seqs_pad, batch_first=True)
+        masks = (seqs_pad != 0).long()
+        data['seqs_pad'] = seqs_pad
+        data['masks'] = masks
+        if mode == 'cand':
+            graphs = []
+            for b in batch:    
+                graphs.append(b['graph'])
+            graphs = Batch.from_data_list(graphs)
+            data['graphs'] = graphs
+        
+        return data
+    return collate_fun

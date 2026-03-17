@@ -16,9 +16,9 @@ from utils.tools import gen_embeddings, build_idx, calculate_remote_homology_sco
 class TrainConfig:
     epochs: int = 10
     gpu: int = 8
-    batch_size: int = 64
+    batch_size: int = 128
     num_workers: int = 4
-    model_name: str = "-4lr_clip_selfmask_topm_no_selfhit"
+    model_name: str = "DualEncoder"
     lr: float = 2e-4
     pdb_root: str = "../../data/pdb"
     tmalign_path: str = "./TMalign"
@@ -99,8 +99,8 @@ class Trainer:
                 print(f"======================= Test epoch {epoch + 1} =======================")
                 self.log_file.write(f"\nEpoch {epoch + 1} Testing\n")
                 pt.cuda.empty_cache()
-                embs_lib = gen_embeddings(self.model, lib_loader, self.config.gpu)
-                embs_test = gen_embeddings(self.model, test_loader, self.config.gpu)
+                embs_lib = gen_embeddings(self.model, lib_loader, self.config.gpu, mode='cand')
+                embs_test = gen_embeddings(self.model, test_loader, self.config.gpu, mode='query')
                 search_k = max(self.config.topk + 1, self.config.eval_search_k)
                 I, _ = build_idx(embs_lib, embs_test, topk=search_k)
                 I_filtered, self_hit_rate = self._filter_self_hits(I, test_map, datalib.map)
@@ -136,20 +136,23 @@ if __name__ == "__main__":
     start_time = datetime.now()
     config = TrainConfig()
     pt.cuda.set_device(config.gpu)
+
     print('loading data')
-    data = pt.load(f'./data/seq_shorter_than_1300_sorted.pt', weights_only=False)
-    whole_data = ProteinDataset(data)
+    data = pt.load(f'./data/sorted_1300_p0_h0.pt', weights_only=False)
+    whole_data = ProteinDataset(data, mode='cand')
     whole_map = np.arange(len(whole_data), dtype=np.int64)
+
     print('number of whole data: ', len(whole_map))
     lib_map, test_map = train_test_split(whole_map, test_size=1024, random_state=42)
     lib_map = np.sort(lib_map)
+    
     print('number of library proteins:', len(lib_map))
     test_map = np.sort(test_map) # 因为原来数据是由短到长的，split打乱了顺序，所以需要排序
     print('Test query num:', len(test_map))
-    datalib = ProteinDataset(whole_data, mapping=lib_map)
-    test_set = ProteinDataset(whole_data, mapping=test_map)      
+    datalib = ProteinDataset(whole_data, mapping=lib_map, mode='cand')
+    test_set = ProteinDataset(whole_data, mapping=test_map, mode='query')      
 
-    pdb2idx = {datalib[i][1]: i for i in range(len(lib_map))}
+    pdb2idx = {datalib[i]['lab']: i for i in range(len(lib_map))}
     query_homo_data = QueryHomologyDataset(datalib, './data/tmalign.out', pdb2idx)
     print('Query_i homology_ij pair num:', len(query_homo_data))  
 
@@ -159,7 +162,7 @@ if __name__ == "__main__":
         batch_size=batch_size // 2,
         shuffle=False,
         num_workers=config.num_workers,
-        collate_fn=collate_fun_emb,
+        collate_fn=collate_fun_emb(mode='cand'),
         pin_memory=True,
         drop_last=False,
     )
@@ -177,13 +180,15 @@ if __name__ == "__main__":
         batch_size=batch_size // 2,
         shuffle=False,
         num_workers=config.num_workers,
-        collate_fn=collate_fun_emb,
+        collate_fn=collate_fun_emb(mode='query'),
         pin_memory=True,
         drop_last=False,
     )
 
     model = DualEncoderRetriever(
         vocab_size=21,
+        node_feat_dim=whole_data[0]['graph'].x.shape[1],
+        edge_feat_dim=whole_data[0]['graph'].edge_attr.shape[1]
     ).cuda(config.gpu)
 
     trainer = Trainer(model, config)

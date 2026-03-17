@@ -2,6 +2,7 @@ import math
 import torch as pt
 import torch.nn as nn
 import torch.nn.functional as F
+import torch_geometric.nn as gnn
 
 
 class PositionalEncoding(nn.Module):
@@ -56,41 +57,162 @@ class SequenceEncoder(nn.Module):
         return pooled
 
 
+class GINEBackbone(nn.Module):
+    def __init__(
+        self,
+        hidden_dim: int,
+        edge_dim: int,
+        num_layers: int = 3,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.edge_dim = edge_dim
+        self.dropout = dropout
+        self.edge_encoder = (
+            nn.Linear(edge_dim, hidden_dim) if edge_dim != hidden_dim else nn.Identity()
+        )
+        self.convs = nn.ModuleList()
+        self.norms = nn.ModuleList()
+
+        for _ in range(num_layers):
+            mlp = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+            )
+            conv = gnn.GINEConv(nn=mlp, train_eps=True, edge_dim=hidden_dim)
+            self.convs.append(conv)
+            self.norms.append(nn.LayerNorm(hidden_dim))
+
+    def forward(self, x, edge_idx, edge_attr=None, batch=None):
+        """
+        x: [N, in_dim]
+        edge_idx: [2, E]
+        edge_attr: [E, edge_dim]
+        """
+        if edge_attr is None:
+            edge_attr = x.new_zeros(edge_idx.size(1), self.edge_dim)
+        edge_attr = self.edge_encoder(edge_attr)
+        for conv, norm in zip(self.convs, self.norms):
+            h = conv(x, edge_idx, edge_attr)
+            h = F.silu(h)
+            h = F.dropout(h, p=self.dropout, training=self.training)
+            x = norm(x + h)  # residual
+        return x
+
+
+class GraphEncoder(nn.Module):
+    def __init__(
+        self,
+        vocab_size: int,
+        node_feat_dim: int,
+        edge_feat_dim: int,
+        gnn_dim: int = 256,
+        gnn_num_layers: int = 3,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        # 为了确保后续在gnn中维度整齐
+        self.seq_encoder = nn.Embedding(num_embeddings=vocab_size, 
+                                        embedding_dim=gnn_dim-node_feat_dim, padding_idx=0)
+        self.gnn = GINEBackbone(
+            hidden_dim=gnn_dim,
+            edge_dim=edge_feat_dim,
+            num_layers=gnn_num_layers,
+            dropout=dropout,
+        )
+
+    def forward(self, seq, mask, graph):
+        """
+        seq: [B, L]
+        mask: [B, L]
+        graph:
+          - x: [N, Fx]
+          - edge_index: [2, E]
+          - edge_attr: [E, Fe]
+          - batch: [N]
+          - node2seq: [N]
+        """
+        x = graph.x.float()
+        edge_idx = graph.edge_index
+        edge_attr = graph.edge_attr.float()
+        batch = graph.batch
+        node2seq = graph.node2seq.long()
+        # [B, L, D]
+        emb = self.seq_encoder(seq)
+        emb = emb * mask.unsqueeze(-1).float()
+        B, L, D = emb.shape
+        if node2seq.min() < 0 or node2seq.max() >= L:
+            raise ValueError(f"node2seq out of range: min={node2seq.min().item()}, max={node2seq.max().item()}, L={L}")
+        emb_flat = emb.reshape(B * L, D)
+        # 第 k 个节点对应到 batch[k] 这个图里的 node2seq[k] 位置
+        flat_idx = batch * L + node2seq
+        node_emb = emb_flat[flat_idx]  # [N, D]
+        # 拼接节点属性
+        x = pt.cat([node_emb, x], dim=-1)  # [N, D + Fx]
+        x = self.gnn(x, edge_idx, edge_attr=edge_attr, batch=batch)
+        x = gnn.global_mean_pool(x, batch)  # [B, hidden_dim]
+        return x
+
+
 class DualEncoderRetriever(nn.Module):
     def __init__(
         self,
         vocab_size: int,
-        d_model: int = 256,
-        nhead: int = 8,
-        num_layers: int = 1,
+        node_feat_dim: int,
+        edge_feat_dim: int,
+        query_d_model: int = 256,
+        query_nhead: int = 8,
+        query_num_layers: int = 1,
+        gnn_dim: int = 256,
+        gnn_num_layers: int = 1,
         dropout: float = 0.1,
         normalize: bool = True,
     ):
         super().__init__()
-        self.encoder = SequenceEncoder(
+        self.query_encoder = SequenceEncoder(
             vocab_size=vocab_size,
-            d_model=d_model,
-            nhead=nhead,
-            num_layers=num_layers,
+            d_model=query_d_model,
+            nhead=query_nhead,
+            num_layers=query_num_layers,
+            dropout=dropout,
+        )
+        self.cand_encoder = GraphEncoder(
+            vocab_size=vocab_size,
+            node_feat_dim=node_feat_dim,
+            edge_feat_dim=edge_feat_dim,
+            gnn_dim=gnn_dim,
+            gnn_num_layers=gnn_num_layers,
             dropout=dropout,
         )
         self.normalize = normalize
 
-    def encode(self, data):
-        seqs, masks = data
-        emb = self.encoder(seqs, masks)
+    def encode_query(self, query_seqs, query_mask):
+        q = self.query_encoder(query_seqs, query_mask)
+        return q
+
+    def encode_cand(self, cand_seqs, cand_masks, cand_graphs):
+        c = self.cand_encoder(cand_seqs, cand_masks, cand_graphs)
+        return c
+
+    def encode(self, data, mode:str='query'): # 建库/检索时用
+        if mode == 'query':
+            query_seqs, query_masks = data['seqs_pad'], data['masks']
+            emb = self.encode_query(query_seqs, query_masks)
+        elif mode == 'cand':
+            cand_seqs, cand_masks, cand_graphs = data['seqs_pad'], data['masks'], data['graphs']
+            emb = self.encode_cand(cand_seqs, cand_masks, cand_graphs)
         if self.normalize:
             emb = F.normalize(emb, p=2, dim=-1)
         return emb
 
     def forward(self, batch):
         query_seqs = batch["query_seqs"]
-        query_mask = batch["query_mask"]
+        query_masks = batch["query_masks"]
         cand_seqs = batch["cand_seqs"]
-        cand_mask = batch["cand_mask"]
+        cand_masks = batch["cand_masks"]
+        cand_graphs = batch["cand_graphs"]
         scores = batch["scores"]
-        q_emb = self.encode((query_seqs, query_mask))  # [B, D]
-        c_emb = self.encode((cand_seqs, cand_mask))  # [B, D]
+        q_emb = self.encode_query(query_seqs, query_masks)  # [B, D]
+        c_emb = self.encode_cand(cand_seqs, cand_masks, cand_graphs)  # [B, D]
         cos_sim = F.cosine_similarity(q_emb, c_emb)
         target = (scores / 0.4).clamp(min=0.0, max=1.0)
         loss = F.mse_loss(cos_sim, target)

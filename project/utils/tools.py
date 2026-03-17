@@ -13,13 +13,18 @@ from torch.utils.data import DataLoader
 
 
 
-def gen_embeddings(model:nn.Module, loader:DataLoader, gpu:int):
+def gen_embeddings(model:nn.Module, loader:DataLoader, gpu:int, mode:str='query'):
     embs = []
     model.eval()
     with pt.no_grad():
-        for seq_pad, masks in loader:
-            data = [d.to(gpu, non_blocking=True) for d in (seq_pad, masks)]
-            emb = model.encode(tuple(data)).detach().cpu().numpy()
+        for data in loader:
+            data_gpu = {}
+            for k, v in data.items():
+                if hasattr(v, 'to'):
+                    data_gpu[k] = v.to(gpu, non_blocking=True)
+                else:
+                    data_gpu[k] = v
+            emb = model.encode(data_gpu, mode).detach().cpu().numpy()
             embs.append(emb)
     pt.cuda.empty_cache()
     embs = np.concatenate(embs, axis=0)
@@ -65,12 +70,12 @@ def generate_tasks(
     if not tmalign_path.is_file():
         raise FileNotFoundError(f"TMalign binary not found: {tmalign_path}")
     for i in range(len(query)):
-        q_name = query[i][-1]
+        q_name = query[i]['lab']
         q_file = make_pdb_path(pdb_root, q_name)
         if not q_file.is_file():
             raise FileNotFoundError(f"Query PDB file not found: {q_file}")
         for j in idx[i][:k]:
-            c_name = database[int(j)][-1]
+            c_name = database[int(j)]['lab']
             c_file = make_pdb_path(pdb_root, c_name)
             if not c_file.is_file():
                 raise FileNotFoundError(f"Candidate PDB file not found: {c_file}")
