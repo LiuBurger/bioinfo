@@ -62,102 +62,38 @@ class DualEncoderRetriever(nn.Module):
         vocab_size: int,
         d_model: int = 256,
         nhead: int = 8,
-        num_layers: int = 2,
+        num_layers: int = 1,
         dropout: float = 0.1,
-        temperature: float = 0.1,
         normalize: bool = True,
-        symmetric_loss: bool = True,
     ):
         super().__init__()
-        self.query_encoder = SequenceEncoder(
+        self.encoder = SequenceEncoder(
             vocab_size=vocab_size,
             d_model=d_model,
             nhead=nhead,
             num_layers=num_layers,
             dropout=dropout,
         )
-        self.candidate_encoder = SequenceEncoder(
-            vocab_size=vocab_size,
-            d_model=d_model,
-            nhead=nhead,
-            num_layers=num_layers,
-            dropout=dropout,
-        )
-        self.temperature = temperature
         self.normalize = normalize
-        self.symmetric_loss = symmetric_loss        
-    
-    def encode(self, data, mode:str='query'):
-        ids, masks = data
-        if mode == 'query':
-            emb = self.query_encoder(ids, masks)
-        elif mode == 'candidate':
-            emb = self.candidate_encoder(ids, masks)
-        else:
-            raise ValueError(f"mode '{mode}' not exist")
+
+    def encode(self, data):
+        seqs, masks = data
+        emb = self.encoder(seqs, masks)
         if self.normalize:
             emb = F.normalize(emb, p=2, dim=-1)
         return emb
 
     def forward(self, batch):
-        """
-        batch 中包含一个 mini-batch 的正样本对：
-        第 i 个 query <-> 第 i 个 candidate 为正样本
-        同 batch 里其他 candidate / query 自动视为负样本
-        batch 应包含：
-        - query_ids:      [B, Lq]
-        - query_mask:     [B, Lq]
-        - cand_ids:       [B, Lc]
-        - cand_mask:      [B, Lc]
-        - candidate_graph: PyG Batch,对应 B 个 candidate 图
-        返回：
-        - loss: InfoNCE 总损失
-        - 以及一些监控指标
-        """
-        query_ids = batch["query_ids"]
+        query_seqs = batch["query_seqs"]
         query_mask = batch["query_mask"]
-        cand_ids = batch["cand_ids"]
+        cand_seqs = batch["cand_seqs"]
         cand_mask = batch["cand_mask"]
-        q_emb = self.query_encoder(query_ids, query_mask)  # [B, D]
-        c_emb = self.candidate_encoder(cand_ids, cand_mask)  # [B, D]
-        """
-        相似度计算,logits[i, j]表示：第 i 个 query 和第 j 个 candidate 的相似度
-        temperature 是对 softmax 的“锐化系数”
-            温度小,比如 0.07,softmax 更尖锐，更强调 hardest negatives
-            温度大,softmax 更平滑
-        对角线位置 logits[i, i] 是正样本
-        """
-        logits = pt.matmul(q_emb, c_emb.t()) / self.temperature # [B, B]
-        B = logits.size(0)
-        targets = pt.arange(B, device=logits.device)
-        # query -> candidate 方向的 InfoNCE
-        loss_q2c = F.cross_entropy(logits, targets)
-        # candidate -> query 方向的 InfoNCE（可选）
-        if self.symmetric_loss:
-            loss_c2q = F.cross_entropy(logits.t(), targets)
-            loss = 0.5 * (loss_q2c + loss_c2q) # 取平均
-        else:
-            loss_c2q = pt.tensor(0.0, device=logits.device)
-            loss = loss_q2c
-        # 计算一些训练监控指标
-        with pt.no_grad():
-            # query->candidate 检索准确率
-            acc_q2c = (logits.argmax(dim=1) == targets).float().mean() # query->candidate 检索准确率
-            # candidate->query 检索准确率
-            acc_c2q = (logits.t().argmax(dim=1) == targets).float().mean() # candidate->query 检索准确率
-            # 正样本平均 logit（对角线）
-            pos_logit_mean = logits.diag().mean()
-            # 负样本平均 logit（非对角线）
-            neg_mask = ~pt.eye(B, dtype=pt.bool, device=logits.device)
-            neg_logit_mean = logits.masked_select(neg_mask).mean()
-
+        scores = batch["scores"]
+        q_emb = self.encode((query_seqs, query_mask))  # [B, D]
+        c_emb = self.encode((cand_seqs, cand_mask))  # [B, D]
+        cos_sim = F.cosine_similarity(q_emb, c_emb)
+        target = (scores / 0.4).clamp(min=0.0, max=1.0)
+        loss = F.mse_loss(cos_sim, target)
         return {
-            "loss": loss,                              # 用于反向传播
-            "loss_q2c": loss_q2c.detach(),             # query->candidate 的损失
-            "loss_c2q": loss_c2q.detach(),             # candidate->query 的损失
-            "retrieval_acc_q2c": acc_q2c.detach(),     # q->c 检索准确率
-            "retrieval_acc_c2q": acc_c2q.detach(),     # c->q 检索准确率
-            "pos_logit_mean": pos_logit_mean.detach(), # 正样本平均相似度
-            "neg_logit_mean": neg_logit_mean.detach(), # 负样本平均相似度
-            "logits": logits,                          # [B, B] 相似度矩阵
+            "loss": loss,
         }

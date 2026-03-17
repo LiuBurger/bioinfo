@@ -13,13 +13,13 @@ from torch.utils.data import DataLoader
 
 
 
-def gen_embeddings(model:nn.Module, loader:DataLoader, gpu:int, mode:str='candidate'):
+def gen_embeddings(model:nn.Module, loader:DataLoader, gpu:int):
     embs = []
     model.eval()
     with pt.no_grad():
         for seq_pad, masks in loader:
             data = [d.to(gpu, non_blocking=True) for d in (seq_pad, masks)]
-            emb = model.encode(tuple(data), mode).detach().cpu().numpy()
+            emb = model.encode(tuple(data)).detach().cpu().numpy()
             embs.append(emb)
     pt.cuda.empty_cache()
     embs = np.concatenate(embs, axis=0)
@@ -92,22 +92,19 @@ def run_tmalign(task):
     seqid_match = re.search(r"Seq_ID=.*?=\s*([0-9.]+)", output)
     tm_scores = re.findall(r"TM-score=\s*([0-9.]+)", output)
     if seqid_match is None:
-        raise ValueError(
-            f"Failed to parse Seq_ID from TMalign output.\n"
-            f"cmd: {' '.join(cmd)}\n"
-            f"stdout:\n{output}"
-        )
+        raise ValueError(f"Failed to parse Seq_ID from TMalign output.\nstdout:\n{output}")
     if not (1 <= reference <= len(tm_scores)):
-        raise ValueError(
-            f"Invalid reference={reference}. "
-            f"Parsed {len(tm_scores)} TM-scores.\n"
-            f"cmd: {' '.join(cmd)}\n"
-            f"stdout:\n{output}"
-        )
+        raise ValueError(f"Invalid reference={reference}. Parsed {len(tm_scores)} TM-scores.\nstdout:\n{output}")
+
     seqid = float(seqid_match.group(1))
     tm_score = float(tm_scores[reference - 1])
     score = tm_score - 0.6 + min(0.4 - seqid, 0.0)
-    return q_idx, c_idx, score 
+
+    return q_idx, c_idx, {
+        "score": score,
+        "tm_score": tm_score,
+        "seqid": seqid,
+    } 
 
 
 def calculate_remote_homology_score(
@@ -118,13 +115,6 @@ def calculate_remote_homology_score(
     reference: int = 1,
     num_workers: int = None,
 ):
-    """
-    并行计算 remote homology score
-    这里使用 ThreadPoolExecutor,而不是 multiprocessing.Pool:
-    - 真正耗时的是外部 TMalign 进程
-    - 线程只负责并发调度 subprocess.run
-    - 避免在已初始化 CUDA 的训练进程里再 fork 多进程
-    """
     N = len(query)
     assert N == len(idx), "The length of query and idx should be the same."
     tasks = list(
@@ -138,18 +128,23 @@ def calculate_remote_homology_score(
     if num_workers is None:
         cpu_count = os.cpu_count() or 1
         num_workers = max(1, min(len(tasks), cpu_count // 2 if cpu_count > 1 else 1))
-    
+
     results_dict = {i: [] for i in range(N)}
     avg_topk_score = 0.0
     success_cnt = 0
     error_messages = []
     with ThreadPoolExecutor(max_workers=num_workers) as executor:
         futures = [executor.submit(run_tmalign, task) for task in tasks]
-        for future in tqdm(as_completed(futures), total=len(futures), desc="TM-align", leave=False,):
+        for future in tqdm(as_completed(futures), total=len(futures), desc="TM-align", leave=False):
             try:
-                q_idx, c_idx, score = future.result()
-                results_dict[q_idx].append({'c_idx': c_idx, 'score': score})
-                avg_topk_score += score
+                q_idx, c_idx, result = future.result()
+                results_dict[q_idx].append({
+                    'c_idx': c_idx,
+                    'score': result['score'],
+                    'tm_score': result['tm_score'],
+                    'seqid': result['seqid'],
+                })
+                avg_topk_score += result['score']
                 success_cnt += 1
             except Exception as e:
                 error_messages.append(str(e))
@@ -161,6 +156,8 @@ def calculate_remote_homology_score(
 
     sorted_results = {}
     avg_top1_score = 0.0
+    avg_top1_tm = 0.0
+    avg_top1_seqid = 0.0
     valid_queries = 0
     for q_idx in range(N):
         c_list = results_dict[q_idx]
@@ -168,11 +165,15 @@ def calculate_remote_homology_score(
         sorted_results[q_idx] = c_list
         if len(c_list) > 0:
             avg_top1_score += c_list[0]['score']
+            avg_top1_tm += c_list[0]['tm_score']
+            avg_top1_seqid += c_list[0]['seqid']
             valid_queries += 1
     if valid_queries > 0:
         avg_top1_score /= valid_queries
-    
-    return sorted_results, avg_top1_score, avg_topk_score
+        avg_top1_tm /= valid_queries
+        avg_top1_seqid /= valid_queries
+
+    return sorted_results, avg_top1_score, avg_topk_score, avg_top1_tm, avg_top1_seqid
 
 
 def save_model(model:nn.Module, model_name:str, epoch:int):

@@ -22,7 +22,7 @@ def load(fn, mode:str='all'):
         if mode in ['part', 'seq']:
             lab = f['label'][()]
         f.close()
-    if mode == 'all':    
+    if mode == 'all':
         return seq, node_ss, node_rsa, node_pos, node_idx, edge_nho, edge_idx, lab
     elif mode == 'part':
         return seq, node_pos, node_idx, edge_nho, edge_idx, lab
@@ -36,9 +36,9 @@ class ProteinDataset(Dataset):
     def __init__(self, dataset, mapping:np.ndarray=None):
         super().__init__()
         if isinstance(dataset, tuple): # raw data
-            self.seq = dataset[0]           
+            self.seq = dataset[0]
             self.lab = dataset[1]
-            self.map = np.arange(len(self.lab), dtype=np.int64) # 恒等映射 
+            self.map = np.arange(len(self.lab), dtype=np.int64) # 恒等映射
             assert len(self.seq) == len(self.lab)
         else: # structured data
             assert mapping is not None, "Mapping must be provided for structured data."
@@ -46,29 +46,28 @@ class ProteinDataset(Dataset):
             self.lab = dataset.lab
             self.map = mapping
             assert np.max(self.map) < len(self.lab)
-    # self.map旨在维护一个data子集的映射，数据仍然是全部数据   
+    # self.map旨在维护一个data子集的映射，数据仍然是全部数据
 
     def __getitem__(self, idx):
         idx = self.map[idx]
         seq, lab = self.seq[idx], self.lab[idx]
         return seq, lab
 
-    def __len__(self):  
+    def __len__(self):
         return len(self.map) #子集的大小是map的大小
-    
+
 
 class QueryHomologyDataset(Dataset):
     def __init__(self, dataset, pair_file:str=None, pdb2idx:dict=None, mapping:np.ndarray=None):
         super().__init__()
         if isinstance(dataset, ProteinDataset): # raw data
             assert pair_file is not None and pdb2idx is not None, "pair_file and pdb2idx must be provided for raw data."
-            df = pd.read_csv(pair_file, names=['name1', 'name2', 'tmscore', 'seqid'], delimiter='\t')
+            df = pd.read_csv(pair_file, names=['name1', 'name2', 'tmscore', 'seqid'], delimiter='	')
             df['name1'] = df['name1'].str.split('/').str[-1].str.removesuffix('.pdb')
             df['name2'] = df['name2'].str.split('/').str[-1].str.removesuffix('.pdb')
             df['idx1'] = df['name1'].map(pdb2idx)
             df['idx2'] = df['name2'].map(pdb2idx)
             df = df.dropna(subset=['idx1', 'idx2'])
-            assert len(df) > 0, "No valid protein pairs found!"
             df['idx1'] = df['idx1'].astype(np.int64)
             df['idx2'] = df['idx2'].astype(np.int64)
             # score = tmscore - 0.6 + min(0, 0.4 - seqid)
@@ -85,73 +84,69 @@ class QueryHomologyDataset(Dataset):
             self.groups = grouped
             self.map = np.arange(len(self.groups), dtype=np.int64) if mapping is None else mapping.astype(np.int64)
         else: # structured data
-            assert hasattr(dataset, 'groups'), \
-                "For structured data, dataset must already contain grouped data in `dataset.groups`."
+            assert hasattr(dataset, 'groups'),                 "For structured data, dataset must already contain grouped data in `dataset.groups`."
             self.groups = dataset.groups
             self.map = mapping.astype(np.int64) if mapping is not None else np.arange(len(self.groups), dtype=np.int64)
             assert np.max(self.map) < len(self.groups), "mapping index out of range."
-    
+
     def __getitem__(self, idx):
         g = self.groups[self.map[idx]]
-        #          0           1        2     
+        #          0           1        2
         return g['idx1'], g['idx2'], g['score']
 
     def __len__(self):
         return len(self.map)
 
 
-def collate_fun_train(protein_dataset, positive_strategy: str = "random",):
-    assert positive_strategy in ["top1", "random", "weighted"]
-    def collate_fun(batch):
-        query_seqs = []
-        cand_seqs = []
-        q_indices = []
-        c_indices = []
-        pos_score = []
-
-        for item in batch:
-            idx1, idx2_list, score_list = item
-            if len(idx2_list) == 0:
-                continue
-            if positive_strategy == "top1":
-                pos_j = 0
-            elif positive_strategy == "random":
-                pos_j = random.randint(0, len(idx2_list) - 1)
-            else:
-                prob = score_list.float().clamp(min=0)
-                if prob.sum() > 0:
-                    prob = prob / prob.sum()
-                    pos_j = pt.multinomial(prob, 1).item()
-                else:
-                    pos_j = random.randint(0, len(idx2_list) - 1)
-
-            idx2 = idx2_list[pos_j]
+def collate_fun_train(protein_dataset, mode:str='weight', top_m:int=16, temperature:float=0.05):
+    """
+    batch item:
+        idx1 : query index
+        idx2_list : list[candidate index]
+        score_list : tensor
+    """
+    def collate_fn(batch):
+        query_seqs, cand_seqs, scores = [], [], []
+        for idx1, idx2_list, score_list in batch:
             q_seq, _ = protein_dataset[idx1]
-            c_seq, _ = protein_dataset[idx2]
             query_seqs.append(q_seq)
+
+            m = min(top_m, len(idx2_list)) if top_m is not None else len(idx2_list)
+            if m <= 0:
+                raise ValueError(f"No candidates found for query idx={idx1}")
+
+            if mode == 'random':
+                idx2_idx = random.randint(0, m - 1)
+            elif mode == 'weight':
+                scores_np = score_list[:m].detach().cpu().numpy().astype(np.float64)
+                logits = scores_np / max(temperature, 1e-8)
+                logits = logits - logits.max()
+                prob = np.exp(logits)
+                prob = prob / prob.sum()
+                idx2_idx = int(np.random.choice(m, p=prob))
+            else:
+                raise ValueError(f"Invalid mode: {mode}. Must be one of 'random' or 'weight'.")
+
+            score = float(score_list[idx2_idx])
+            scores.append(score)
+            cand_idx = int(idx2_list[idx2_idx])
+            c_seq, _ = protein_dataset[cand_idx]
             cand_seqs.append(c_seq)
-            q_indices.append(idx1)
-            c_indices.append(idx2)
-            pos_score.append(score_list[pos_j].float())
 
-        if len(query_seqs) == 0:
-            raise RuntimeError("Empty batch after positive pair selection.")
-
-        query_ids = pad_sequence(query_seqs, batch_first=True)
-        query_mask = (query_ids != 0).long()
-        cand_ids = pad_sequence(cand_seqs, batch_first=True)
-        cand_mask = (cand_ids != 0).long()
-
+        query_seqs = pad_sequence(query_seqs, batch_first=True)
+        cand_seqs = pad_sequence(cand_seqs, batch_first=True)
+        query_mask = (query_seqs != 0).long()
+        cand_mask = (cand_seqs != 0).long()
+        scores = pt.tensor(scores, dtype=pt.float32)
         return {
-            "query_ids": query_ids,
+            "query_seqs": query_seqs,
             "query_mask": query_mask,
-            "cand_ids": cand_ids,
+            "cand_seqs": cand_seqs,
             "cand_mask": cand_mask,
-            "q_idx": pt.tensor(q_indices, dtype=pt.long),
-            "c_idx": pt.tensor(c_indices, dtype=pt.long),
-            "score": pt.stack(pos_score),
+            "scores": scores,
         }
-    return collate_fun
+
+    return collate_fn
 
 
 
