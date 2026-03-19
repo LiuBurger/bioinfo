@@ -166,8 +166,10 @@ class DualEncoderRetriever(nn.Module):
         gnn_num_layers: int = 1,
         dropout: float = 0.1,
         normalize: bool = True,
+        margin: float = 0.2,
     ):
         super().__init__()
+        self.margin = margin
         self.query_encoder = SequenceEncoder(
             vocab_size=vocab_size,
             d_model=query_d_model,
@@ -207,6 +209,34 @@ class DualEncoderRetriever(nn.Module):
     def forward(self, batch):
         query_seqs = batch["query_seqs"]
         query_masks = batch["query_masks"]
+
+        # 带显式负样本的 margin ranking（推荐）
+        if "pos_cand_seqs" in batch:
+            pos_seqs = batch["pos_cand_seqs"]
+            pos_masks = batch["pos_cand_masks"]
+            pos_graphs = batch["pos_cand_graphs"]
+            neg_seqs = batch["neg_cand_seqs"]
+            neg_masks = batch["neg_cand_masks"]
+            neg_graphs = batch["neg_cand_graphs"]
+            num_neg = int(batch["num_neg"])
+            B = query_seqs.size(0)
+
+            q_emb = self.encode_query(query_seqs, query_masks)  # [B, D]
+            pos_emb = self.encode_cand(pos_seqs, pos_masks, pos_graphs)  # [B, D]
+            neg_emb = self.encode_cand(neg_seqs, neg_masks, neg_graphs)  # [B*num_neg, D]
+            if self.normalize:
+                q_emb = F.normalize(q_emb, p=2, dim=-1)
+                pos_emb = F.normalize(pos_emb, p=2, dim=-1)
+                neg_emb = F.normalize(neg_emb, p=2, dim=-1)
+
+            neg_emb = neg_emb.view(B, num_neg, -1)
+            sim_pos = (q_emb * pos_emb).sum(dim=-1)  # [B]
+            sim_neg = (q_emb.unsqueeze(1) * neg_emb).sum(dim=-1)  # [B, num_neg]
+            # 希望 sim_pos > sim_neg + margin
+            loss = F.relu(self.margin - (sim_pos.unsqueeze(1) - sim_neg)).mean()
+            return {"loss": loss}
+
+        # 兼容旧版：单正样本 + MSE(cos_sim, score/0.4)
         cand_seqs = batch["cand_seqs"]
         cand_masks = batch["cand_masks"]
         cand_graphs = batch["cand_graphs"]
@@ -216,6 +246,4 @@ class DualEncoderRetriever(nn.Module):
         cos_sim = F.cosine_similarity(q_emb, c_emb)
         target = (scores / 0.4).clamp(min=0.0, max=1.0)
         loss = F.mse_loss(cos_sim, target)
-        return {
-            "loss": loss,
-        }
+        return {"loss": loss}

@@ -139,26 +139,32 @@ if __name__ == "__main__":
 
     print('loading data')
     data = pt.load(f'./data/sorted_1300_p0_h0.pt', weights_only=False)
-    whole_data = ProteinDataset(data, mode='cand')
-    whole_map = np.arange(len(whole_data), dtype=np.int64)
-
-    print('number of whole data: ', len(whole_map))
-    lib_map, test_map = train_test_split(whole_map, test_size=1024, random_state=42)
-    lib_map = np.sort(lib_map)
-    
+    lib_data = ProteinDataset(data, mode='cand')
+    lib_map = np.arange(len(lib_data), dtype=np.int64)
     print('number of library proteins:', len(lib_map))
-    test_map = np.sort(test_map) # 因为原来数据是由短到长的，split打乱了顺序，所以需要排序
-    print('Test query num:', len(test_map))
-    datalib = ProteinDataset(whole_data, mapping=lib_map, mode='cand')
-    test_set = ProteinDataset(whole_data, mapping=test_map, mode='query')      
 
-    pdb2idx = {datalib[i]['lab']: i for i in range(len(lib_map))}
-    query_homo_data = QueryHomologyDataset(datalib, './data/tmalign.out', pdb2idx)
-    print('Query_i homology_ij pair num:', len(query_homo_data))  
+    pdb2idx = {lib_data[i]['lab']: i for i in range(len(lib_map))}
+    train_set = QueryHomologyDataset(lib_data, './data/tmalign.out', pdb2idx)
+    train_map = np.arange(len(train_set), dtype=np.int64)
+   
+    train_map, test_map = train_test_split(train_map, test_size=1024, random_state=42)
+    train_map, val_map = train_test_split(train_map, test_size=2048, random_state=42)
+    train_map = np.sort(train_map)
+    val_map = np.sort(val_map)
+    test_map = np.sort(test_map)
+    print('Train query num:', len(train_map))
+    print('Val query num:', len(val_map))
+    print('Test query num:', len(test_map))
+    
+    val_set = ProteinDataset(lib_data, mapping=val_map, mode='query')
+    test_set = ProteinDataset(lib_data, mapping=test_map, mode='query')      
+
+    
+    print('Query_i homology_ij pair num:', len(train_set))  
 
     batch_size = config.batch_size
     libloader = DataLoader(
-        datalib,
+        lib_data,
         batch_size=batch_size // 2,
         shuffle=False,
         num_workers=config.num_workers,
@@ -167,13 +173,22 @@ if __name__ == "__main__":
         drop_last=False,
     )
     train_loader = DataLoader(
-        query_homo_data,
+        train_set,
         batch_size=batch_size,
         shuffle=True,
         num_workers=config.num_workers,
-        collate_fn=collate_fun_train(datalib, mode='weight', top_m=config.train_top_m),
+        collate_fn=collate_fun_train(lib_data),
         pin_memory=True,
-        drop_last=True,
+        drop_last=False,
+    )
+    val_loader = DataLoader(
+        val_set,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=config.num_workers,
+        collate_fn=collate_fun_emb(mode='query'),
+        pin_memory=True,
+        drop_last=False,
     )
     test_loader = DataLoader(
         test_set,
@@ -197,9 +212,9 @@ if __name__ == "__main__":
         test_loader=test_loader,
         lib_loader=libloader,
         test_set=test_set,
-        datalib=datalib,
+        datalib=lib_data,
         test_map=test_map,
     )
     pt.cuda.empty_cache()
-    end_time = start_time.now()
-    print(f"whole time consuming: {end_time-start_time}")
+    end_time = datetime.now()
+    print(f"whole time consuming: {end_time - start_time}")

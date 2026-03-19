@@ -1,4 +1,6 @@
 import math
+from typing import Dict
+
 import torch as pt
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,15 +12,32 @@ class PositionalEncoding(nn.Module):
         super().__init__()
         pe = pt.zeros(max_len, d_model)
         position = pt.arange(0, max_len, dtype=pt.float).unsqueeze(1)
-        div_term = pt.exp(
-            pt.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)
-        )
+        div_term = pt.exp(pt.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
         pe[:, 0::2] = pt.sin(position * div_term)
         pe[:, 1::2] = pt.cos(position * div_term)
         self.register_buffer("pe", pe.unsqueeze(0))
 
     def forward(self, x):
-        return x + self.pe[:, : x.size(1)]
+        return x + self.pe[:, :x.size(1)]
+
+
+class ProjectionHead(nn.Module):
+    def __init__(self, dim: int, proj_dim: int = None, dropout: float = 0.1):
+        super().__init__()
+        if proj_dim is None:
+            proj_dim = dim
+        self.net = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim, proj_dim),
+        )
+        self.norm = nn.LayerNorm(proj_dim)
+
+    def forward(self, x):
+        x = self.net(x)
+        x = self.norm(x)
+        return x
 
 
 class SequenceEncoder(nn.Module):
@@ -27,7 +46,7 @@ class SequenceEncoder(nn.Module):
         vocab_size: int,
         d_model: int = 256,
         nhead: int = 8,
-        num_layers: int = 1,
+        num_layers: int = 2,
         dropout: float = 0.1,
         max_len: int = 1300,
     ):
@@ -68,28 +87,29 @@ class GINEBackbone(nn.Module):
         super().__init__()
         self.edge_dim = edge_dim
         self.dropout = dropout
-        self.edge_encoder = (
-            nn.Linear(edge_dim, hidden_dim) if edge_dim != hidden_dim else nn.Identity()
-        )
+        self.edge_encoder = nn.Linear(edge_dim, hidden_dim) if edge_dim != hidden_dim else nn.Identity()
         self.convs = nn.ModuleList()
         self.norms = nn.ModuleList()
 
         for _ in range(num_layers):
             mlp = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
+                nn.Linear(hidden_dim, 2 * hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(2 * hidden_dim, hidden_dim),
             )
             conv = gnn.GINEConv(nn=mlp, train_eps=True, edge_dim=hidden_dim)
             self.convs.append(conv)
             self.norms.append(nn.LayerNorm(hidden_dim))
 
-    def forward(self, x, edge_idx, edge_attr=None, batch=None):
+    def forward(self, x, edge_idx, edge_attr=None):
         if edge_attr is None:
             edge_attr = x.new_zeros(edge_idx.size(1), self.edge_dim)
         edge_attr = self.edge_encoder(edge_attr)
 
         for conv, norm in zip(self.convs, self.norms):
             h = conv(x, edge_idx, edge_attr)
-            h = F.silu(h)
+            h = F.gelu(h)
             h = F.dropout(h, p=self.dropout, training=self.training)
             x = norm(x + h)
         return x
@@ -106,9 +126,13 @@ class GraphEncoder(nn.Module):
         dropout: float = 0.1,
     ):
         super().__init__()
+        seq_dim = gnn_dim - node_feat_dim
+        if seq_dim <= 0:
+            raise ValueError(f"gnn_dim ({gnn_dim}) must be larger than node_feat_dim ({node_feat_dim}).")
+
         self.seq_encoder = nn.Embedding(
             num_embeddings=vocab_size,
-            embedding_dim=gnn_dim - node_feat_dim,
+            embedding_dim=seq_dim,
             padding_idx=0
         )
         self.gnn = GINEBackbone(
@@ -139,7 +163,7 @@ class GraphEncoder(nn.Module):
         node_emb = emb_flat[flat_idx]
 
         x = pt.cat([node_emb, x], dim=-1)
-        x = self.gnn(x, edge_idx, edge_attr=edge_attr, batch=batch)
+        x = self.gnn(x, edge_idx, edge_attr=edge_attr)
         x = gnn.global_mean_pool(x, batch)
         return x
 
@@ -152,19 +176,20 @@ class DualEncoderRetriever(nn.Module):
         edge_feat_dim: int,
         query_d_model: int = 256,
         query_nhead: int = 8,
-        query_num_layers: int = 1,
+        query_num_layers: int = 3,
         gnn_dim: int = 256,
-        gnn_num_layers: int = 1,
+        gnn_num_layers: int = 3,
         dropout: float = 0.1,
         normalize: bool = True,
-        rank_target_temperature: float = 0.10,
-        rank_pred_temperature: float = 0.05,
-        lambda_pull: float = 0.05,
-        lambda_var: float = 0.05,
-        lambda_cov: float = 0.01,
-        variance_gamma: float = 1.0,
+        margin: float = 0.2,
     ):
         super().__init__()
+        if query_d_model != gnn_dim:
+            raise ValueError('query_d_model must equal gnn_dim because query/candidate embeddings are compared directly.')
+        self.embed_dim = query_d_model
+        self.normalize = normalize
+        self.margin = margin
+
         self.query_encoder = SequenceEncoder(
             vocab_size=vocab_size,
             d_model=query_d_model,
@@ -181,13 +206,8 @@ class DualEncoderRetriever(nn.Module):
             dropout=dropout,
         )
 
-        self.normalize = normalize
-        self.rank_target_temperature = rank_target_temperature
-        self.rank_pred_temperature = rank_pred_temperature
-        self.lambda_pull = lambda_pull
-        self.lambda_var = lambda_var
-        self.lambda_cov = lambda_cov
-        self.variance_gamma = variance_gamma
+        self.tm_head = nn.Linear(self.embed_dim, 1)
+        self.seqid_head = nn.Linear(self.embed_dim, 1)
 
     def encode_query(self, query_seqs, query_mask):
         return self.query_encoder(query_seqs, query_mask)
@@ -197,122 +217,136 @@ class DualEncoderRetriever(nn.Module):
 
     def encode(self, data, mode: str = 'query'):
         if mode == 'query':
-            query_seqs, query_masks = data['seqs_pad'], data['masks']
-            emb = self.encode_query(query_seqs, query_masks)
+            emb = self.encode_query(data['seqs_pad'], data['masks'])
         elif mode == 'cand':
-            cand_seqs, cand_masks, cand_graphs = data['seqs_pad'], data['masks'], data['graphs']
-            emb = self.encode_cand(cand_seqs, cand_masks, cand_graphs)
+            emb = self.encode_cand(data['seqs_pad'], data['masks'], data['graphs'])
         else:
-            raise ValueError(f"Invalid mode: {mode}")
-
+            raise ValueError("mode must be either 'query' or 'cand'.")
         if self.normalize:
             emb = F.normalize(emb, p=2, dim=-1)
         return emb
 
-    @staticmethod
-    def _masked_log_softmax(logits, mask, dim=-1):
-        fill_value = pt.finfo(logits.dtype).min
-        logits = logits.masked_fill(~mask, fill_value)
-        return F.log_softmax(logits, dim=dim)
+    def _maybe_normalize(self, x):
+        return F.normalize(x, p=2, dim=-1) if self.normalize else x
 
-    def _listwise_rank_loss(self, sims, scores, mask):
-        """
-        sims:   [B, K]
-        scores: [B, K]
-        mask:   [B, K]
-        """
-        target_logits = scores / max(self.rank_target_temperature, 1e-8)
-        target_logits = target_logits.masked_fill(~mask, pt.finfo(scores.dtype).min)
-        target_prob = F.softmax(target_logits, dim=-1)
+    def _pair_regression(self, q_emb, c_emb):
+        pair_feat = q_emb * c_emb
+        tm_pred = pt.sigmoid(self.tm_head(pair_feat)).squeeze(-1)
+        seqid_pred = pt.sigmoid(self.seqid_head(pair_feat)).squeeze(-1)
+        return tm_pred, seqid_pred
 
-        pred_logits = sims / max(self.rank_pred_temperature, 1e-8)
-        pred_log_prob = self._masked_log_softmax(pred_logits, mask, dim=-1)
+    def forward(self, batch: Dict[str, pt.Tensor]):
+        q_emb = self.encode_query(batch['query_seqs'], batch['query_masks'])
+        pos_emb = self.encode_cand(batch['pos_seqs'], batch['pos_masks'], batch['pos_graphs'])
+        neg_emb = self.encode_cand(batch['neg_seqs'], batch['neg_masks'], batch['neg_graphs'])
 
-        per_query_loss = -(target_prob * pred_log_prob).sum(dim=-1)
-        valid_query = mask.any(dim=-1)
-        return per_query_loss[valid_query].mean()
+        q_rank = self._maybe_normalize(q_emb)
+        pos_rank = self._maybe_normalize(pos_emb)
+        neg_rank = self._maybe_normalize(neg_emb)
 
-    @staticmethod
-    def _weighted_pull_loss(sims, scores, mask):
-        weights = scores.clamp(min=0.0) * mask.float()
-        weight_sum = weights.sum(dim=-1, keepdim=True)
+        pos_score = (q_rank * pos_rank).sum(dim=-1)
+        neg_score = (q_rank * neg_rank).sum(dim=-1)
+        bpr_loss = F.softplus(neg_score - pos_score).mean()
 
-        uniform_weights = mask.float()
-        uniform_weights = uniform_weights / uniform_weights.sum(dim=-1, keepdim=True).clamp(min=1.0)
-
-        weights = pt.where(
-            weight_sum > 0,
-            weights / weight_sum.clamp(min=1e-8),
-            uniform_weights,
-        )
-
-        per_query_loss = ((1.0 - sims) * weights).sum(dim=-1)
-        valid_query = mask.any(dim=-1)
-        return per_query_loss[valid_query].mean()
-
-    def _variance_loss(self, z, eps=1e-4):
-        if z.size(0) <= 1:
-            return z.new_tensor(0.0)
-        std = pt.sqrt(z.var(dim=0, unbiased=False) + eps)
-        return F.relu(self.variance_gamma - std).mean()
-
-    @staticmethod
-    def _covariance_loss(z):
-        if z.size(0) <= 1:
-            return z.new_tensor(0.0)
-        z = z - z.mean(dim=0, keepdim=True)
-        n, d = z.shape
-        cov = (z.T @ z) / max(n - 1, 1)
-        off_diag = cov - pt.diag(pt.diag(cov))
-        return off_diag.pow(2).sum() / d
-
-    def forward(self, batch):
-        query_seqs = batch["query_seqs"]
-        query_masks = batch["query_masks"]
-        cand_seqs = batch["cand_seqs"]
-        cand_masks = batch["cand_masks"]
-        cand_graphs = batch["cand_graphs"]
-        scores = batch["scores"]                  # [B, K]
-        pos_valid_mask = batch["pos_valid_mask"]  # [B, K]
-
-        B, K = scores.shape
-
-        q_emb = self.encode_query(query_seqs, query_masks)              # [B, D]
-        c_emb = self.encode_cand(cand_seqs, cand_masks, cand_graphs)    # [B*K, D]
-        c_emb = c_emb.view(B, K, -1)
-
-        if self.normalize:
-            q_emb = F.normalize(q_emb, p=2, dim=-1)
-            c_emb = F.normalize(c_emb, p=2, dim=-1)
-
-        sims = (q_emb.unsqueeze(1) * c_emb).sum(dim=-1)                 # [B, K]
-
-        rank_loss = self._listwise_rank_loss(sims, scores, pos_valid_mask)
-        pull_loss = self._weighted_pull_loss(sims, scores, pos_valid_mask)
-
-        q_reg = q_emb
-        c_reg = c_emb[pos_valid_mask]  # [N_valid, D]
-
-        var_loss = self._variance_loss(q_reg) + self._variance_loss(c_reg)
-        cov_loss = self._covariance_loss(q_reg) + self._covariance_loss(c_reg)
-
-        loss = (
-            rank_loss
-            + self.lambda_pull * pull_loss
-            + self.lambda_var * var_loss
-            + self.lambda_cov * cov_loss
-        )
-
-        valid_sims = sims[pos_valid_mask]
-        sim_mean = valid_sims.mean() if valid_sims.numel() > 0 else sims.new_tensor(0.0)
-        sim_std = valid_sims.std(unbiased=False) if valid_sims.numel() > 1 else sims.new_tensor(0.0)
-
-        return {
-            "loss": loss,
-            "rank_loss": rank_loss.detach(),
-            "pull_loss": pull_loss.detach(),
-            "var_loss": var_loss.detach(),
-            "cov_loss": cov_loss.detach(),
-            "sim_mean": sim_mean.detach(),
-            "sim_std": sim_std.detach(),
+        tm_pred, seqid_pred = self._pair_regression(q_emb, pos_emb)
+        out = {
+            'bpr_loss': bpr_loss,
+            'tm_pred': tm_pred,
+            'seqid_pred': seqid_pred,
+            'pos_score': pos_score,
+            'neg_score': neg_score,
         }
+        if 'tmscores' in batch:
+            out['tm_l1'] = F.l1_loss(tm_pred, batch['tmscores'])
+        if 'seqids' in batch:
+            out['seqid_l1'] = F.l1_loss(seqid_pred, batch['seqids'])
+        return out
+
+
+class MultiBPROptimizer(pt.optim.AdamW):
+    """代码1风格的 BPR + TM/SeqID 辅助优化器。"""
+
+    def __init__(self, ranker: nn.Module, lr: float, weight_decay: float = 0.0, alpha: float = 0.0):
+        self.alpha = alpha
+        super().__init__(ranker.parameters(), lr=lr, weight_decay=weight_decay)
+
+    def combine_loss(self, bpr_loss, tm_pred, tm_true, seqid_pred, seqid_true):
+        aux_loss = pt.mean(pt.abs(tm_pred - tm_true) + pt.abs(seqid_pred - seqid_true))
+        return bpr_loss + self.alpha * aux_loss, aux_loss
+
+    def _step(
+        self,
+        bpr_loss: pt.Tensor,
+        tmscore_pred: pt.Tensor,
+        tmscore_true: pt.Tensor,
+        seqid_pred: pt.Tensor,
+        seqid_true: pt.Tensor,
+        grad_clip: float = 1.0,
+    ):
+        loss, aux_loss = self.combine_loss(bpr_loss, tmscore_pred, tmscore_true, seqid_pred, seqid_true)
+        self.zero_grad(set_to_none=True)
+        loss.backward()
+        grad_norm = pt.nn.utils.clip_grad_norm_(self.param_groups[0]['params'], grad_clip)
+        self.step()
+        if not isinstance(grad_norm, pt.Tensor):
+            grad_norm = pt.tensor(float(grad_norm))
+        return {
+            'loss': loss.detach(),
+            'aux_loss': aux_loss.detach(),
+            'grad_norm': grad_norm.detach(),
+        }
+
+
+class CosineAnnealingWarmRestartsWarmup(pt.optim.lr_scheduler._LRScheduler):
+    """
+    代码1风格：warmup + cosine annealing + warm restart。
+    以 epoch 为步长调用 scheduler.step()。
+    """
+
+    def __init__(
+        self,
+        optimizer,
+        T_0,
+        T_mult=1,
+        eta_min=0.0,
+        last_epoch=-1,
+        warmup=0,
+        decay=1.0,
+    ):
+        self.T_0 = int(T_0)
+        self.T_mult = int(T_mult)
+        self.eta_min = float(eta_min)
+        self.warmup = int(warmup)
+        self.decay = float(decay)
+        self.cycle_length = max(1, self.T_0)
+        self.cycle_start = 0
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        epoch = self.last_epoch
+        if self.warmup > 0 and epoch < self.warmup:
+            warm_ratio = float(epoch + 1) / float(self.warmup)
+            return [base_lr * warm_ratio for base_lr in self.base_lrs]
+
+        effective_epoch = epoch - self.warmup
+        cycle_len = self.cycle_length
+        cycle_start = self.cycle_start
+        cycle_idx = 0
+        while effective_epoch >= cycle_start + cycle_len:
+            cycle_start += cycle_len
+            cycle_len = max(1, cycle_len * self.T_mult)
+            cycle_idx += 1
+        self.cycle_start = cycle_start
+        self.cycle_length = cycle_len
+
+        cycle_pos = effective_epoch - cycle_start
+        decay_factor = self.decay ** cycle_idx
+        lrs = []
+        for base_lr in self.base_lrs:
+            cur_base = base_lr * decay_factor
+            lr = self.eta_min + (cur_base - self.eta_min) * (1 + math.cos(math.pi * cycle_pos / cycle_len)) / 2.0
+            lrs.append(lr)
+        return lrs
+
+
+CosineAnnealingWarmRestarts_Warmup = CosineAnnealingWarmRestartsWarmup

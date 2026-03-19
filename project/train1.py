@@ -1,77 +1,109 @@
-import torch as pt
+import argparse
 import numpy as np
+import torch as pt
 from tqdm import tqdm
 from datetime import datetime
-from dataclasses import dataclass
-from torch.utils.data import DataLoader
 from sklearn.model_selection import train_test_split
+from torch.utils.data import DataLoader
 
 from utils.data1 import ProteinDataset, QueryHomologyDataset, collate_fun_train, collate_fun_emb
-from utils.model1 import DualEncoderRetriever
-from utils.tools import gen_embeddings, build_idx, calculate_remote_homology_score, save_model
+from utils.model1 import DualEncoderRetriever, MultiBPROptimizer, CosineAnnealingWarmRestartsWarmup
+from utils.tools1 import (
+    gen_embeddings,
+    build_idx,
+    calculate_remote_homology_score,
+    save_model, 
+)
 
 
-@dataclass
-class TrainConfig:
-    epochs: int = 30
-    gpu: int = 0
 
-    # 现在一个 query 对应多个正样本，batch 需要适当减小
-    batch_size: int = 32
-    num_workers: int = 4
-    model_name: str = "DualEncoder_listwise_varcov"
-    lr: float = 2e-4
+def parse_args():
+    parser = argparse.ArgumentParser(description="DualEncoder training config")
 
-    pdb_root: str = "../../data/pdb"
-    tmalign_path: str = "./TMalign"
-    topk: int = 12
-    eval_search_k: int = 128
+    # training
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--gpu", type=int, default=9)
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--eval_batch_size", type=int, default=16)
+    parser.add_argument("--num_workers", type=int, default=8)
 
-    # 训练采样
-    train_num_pos: int = 6
-    train_top_m: int = 64
-    train_sample_mode: str = "stratified"   # 'stratified' / 'weight' / 'random' / 'top'
-    train_sample_temperature: float = 0.15
-    strata_boundaries: tuple = (4, 16, 64)
+    # optimization
+    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--alpha", type=float, default=1.0)
+    parser.add_argument("--eta_min", type=float, default=1e-6)
+    parser.add_argument("--warmup_epochs", type=int, default=5)
+    parser.add_argument("--restart_t0", type=int, default=10)
+    parser.add_argument("--restart_tmult", type=int, default=2)
+    parser.add_argument("--restart_decay", type=float, default=0.8)
+    parser.add_argument("--grad_clip", type=float, default=1.0)
 
-    # listwise 参数
-    rank_target_temperature: float = 0.10
-    rank_pred_temperature: float = 0.05
+    # retrieval / evaluation
+    parser.add_argument("--topk", type=int, default=12)
+    parser.add_argument("--eval_search_k", type=int, default=128)
+    parser.add_argument("--tmalign_reference", type=int, default=1)
+    parser.add_argument("--tmalign_workers", type=int, default=None)
+    parser.add_argument("--test_size", type=int, default=1024)
+    parser.add_argument("--random_state", type=int, default=42)
 
-    # 正则权重
-    lambda_pull: float = 0.05
-    lambda_var: float = 0.05
-    lambda_cov: float = 0.01
-    variance_gamma: float = 1.0
+    # paths
+    parser.add_argument("--data_path", type=str, default="./data/sorted_1300_p0_h0.pt")
+    parser.add_argument("--pdb_root", type=str, default="../../data/pdb")
+    parser.add_argument("--tmalign_path", type=str, default="./TMalign")
+    parser.add_argument("--pair_file", type=str, default="./data/tmalign.out")
+    parser.add_argument("--save_path", type=str, default="./model/")
+    parser.add_argument("--model_name", type=str, default="DualEncoder")
 
-    # 模型深度，先保守一点；你后面可以继续加深
-    query_num_layers: int = 1
-    gnn_num_layers: int = 1
-
-    tmalign_reference: int = 1
-    tmalign_workers: int = None
+    return parser.parse_args()
 
 
 class Trainer:
-    def __init__(self, model, config: TrainConfig):
+    def __init__(self, model, config: argparse.Namespace):
         super().__init__()
         self.model = model
         self.config = config
+        self.device = pt.device(f"cuda:{config.gpu}" if pt.cuda.is_available() else "cpu")
+
         self.log_file = open(f"{config.model_name}.txt", "w", encoding="utf-8")
-        self.max_top1, self.max_topk = float("-inf"), float("-inf")
-        self.optimizer = pt.optim.AdamW(self.model.parameters(), lr=config.lr)
-        self.scheduler = pt.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=config.epochs, eta_min=config.lr / 100
+
+        self.optimizer = MultiBPROptimizer(
+            ranker=self.model,
+            lr=config.lr,
+            weight_decay=config.weight_decay,
+            alpha=config.alpha,
         )
+
+        self.scheduler = CosineAnnealingWarmRestartsWarmup(
+            self.optimizer,
+            T_0=config.restart_t0,
+            T_mult=config.restart_tmult,
+            eta_min=config.eta_min,
+            warmup=config.warmup_epochs,
+            decay=config.restart_decay,
+        )
+
+        self.max_top1_score = 0
+        self.max_topk_score = 0
 
     def close(self):
         if not self.log_file.closed:
             self.log_file.close()
 
-    def _filter_self_hits(self, I: np.ndarray, test_map: np.ndarray, lib_map: np.ndarray):
+    def _log(self, msg: str):
+        print(msg)
+        self.log_file.write(msg + "\n")
+        self.log_file.flush()
+
+    def _to_device(self, batch):
+        batch_gpu = {}
+        for k, v in batch.items():
+            batch_gpu[k] = v.to(self.device, non_blocking=True) if hasattr(v, "to") else v
+        return batch_gpu
+
+    def _filter_self_hits(self, indices: np.ndarray, query_map: np.ndarray, lib_map: np.ndarray):
         filtered = []
         self_hits = 0
-        for row, q_global_idx in zip(I, test_map):
+        for row, q_global_idx in zip(indices, query_map):
             row_filtered = []
             hit_self = False
             for j_local in row:
@@ -85,184 +117,175 @@ class Trainer:
                     break
             filtered.append(row_filtered)
             self_hits += int(hit_self)
-
-        self_hit_rate = self_hits / max(len(test_map), 1)
+        self_hit_rate = self_hits / max(len(query_map), 1)
         return filtered, self_hit_rate
 
-    def train(self, train_loader: DataLoader, test_loader: DataLoader, lib_loader: DataLoader, test_set, datalib, test_map):
+    def train(
+        self,
+        train_loader,
+        test_loader,
+        lib_loader,
+        test_map,
+        test_set,
+        datalib,
+    ):
         try:
             for epoch in range(self.config.epochs):
-                print(f"======================= Train epoch {epoch + 1} =======================")
-                self.log_file.write(f"\nEpoch {epoch + 1} Training\n")
+                self._log(f"======================= Train epoch {epoch + 1} =======================")
                 self.model.train()
 
-                for i, batch in enumerate(tqdm(train_loader, unit="batch")):
-                    batch_gpu = {}
-                    for k, v in batch.items():
-                        if hasattr(v, 'to'):
-                            batch_gpu[k] = v.to(self.config.gpu, non_blocking=True)
-                        else:
-                            batch_gpu[k] = v
+                running = {"loss": 0.0, "bpr": 0.0, "tm": 0.0, "seqid": 0.0, "grad_norm": 0.0}
+                steps = 0
 
+                for batch in tqdm(train_loader, unit="batch"):
+                    batch_gpu = self._to_device(batch)
                     output = self.model(batch_gpu)
-                    loss = output["loss"]
 
-                    self.optimizer.zero_grad(set_to_none=True)
-                    loss.backward()
-                    grad_norm = pt.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                    self.optimizer.step()
+                    step_stats = self.optimizer._step(
+                        output["bpr_loss"],
+                        output["tm_pred"],
+                        batch_gpu["tmscores"],
+                        output["seqid_pred"],
+                        batch_gpu["seqids"],
+                        grad_clip=self.config.grad_clip,
+                    )
 
-                    if (i + 1) % 100 == 0:
-                        msg = (
-                            f"Epoch [{epoch + 1}/{self.config.epochs}], Step [{i+1}]\n"
-                            f"Train Loss: {float(loss):.4f}\n"
-                            f"Rank Loss: {float(output['rank_loss']):.4f}\n"
-                            f"Pull Loss: {float(output['pull_loss']):.4f}\n"
-                            f"Var Loss: {float(output['var_loss']):.4f}\n"
-                            f"Cov Loss: {float(output['cov_loss']):.4f}\n"
-                            f"Positive Sim Mean: {float(output['sim_mean']):.4f}\n"
-                            f"Positive Sim Std: {float(output['sim_std']):.4f}\n"
-                            f"Grad_norm: {float(grad_norm):.4f}\n"
-                            f"LR: {self.optimizer.param_groups[0]['lr']:.6e}"
-                        )
-                        print(msg)
-                        self.log_file.write(msg + "\n")
+                    steps += 1
+                    running["loss"] += float(step_stats["loss"])
+                    running["bpr"] += float(output["bpr_loss"].detach())
+                    running["tm"] += float(pt.mean(pt.abs(output["tm_pred"].detach() - batch_gpu["tmscores"])).detach())
+                    running["seqid"] += float(pt.mean(pt.abs(output["seqid_pred"].detach() - batch_gpu["seqids"])).detach())
+                    running["grad_norm"] += float(step_stats["grad_norm"])
 
                 self.scheduler.step()
 
-                print(f"======================= Test epoch {epoch + 1} =======================")
-                self.log_file.write(f"\nEpoch {epoch + 1} Testing\n")
-                pt.cuda.empty_cache()
-
-                embs_lib = gen_embeddings(self.model, lib_loader, self.config.gpu, mode='cand')
-                embs_test = gen_embeddings(self.model, test_loader, self.config.gpu, mode='query')
-
-                search_k = max(self.config.topk + 1, self.config.eval_search_k)
-                I, _ = build_idx(embs_lib, embs_test, topk=search_k)
-                I_filtered, self_hit_rate = self._filter_self_hits(I, test_map, datalib.map)
-
-                _, avg_top1_score, avg_topk_score, avg_top1_tm, avg_top1_seqid = calculate_remote_homology_score(
-                    query=test_set,
-                    database=datalib,
-                    idx=I_filtered,
-                    k=self.config.topk,
-                    pdb_root=self.config.pdb_root,
-                    tmalign_path=self.config.tmalign_path,
-                    reference=self.config.tmalign_reference,
-                    num_workers=self.config.tmalign_workers,
+                self._log(
+                    f"Train loss: {running['loss'] / max(steps, 1):.6f} | "
+                    f"BPR: {running['bpr'] / max(steps, 1):.6f} | "
+                    f"TM L1: {running['tm'] / max(steps, 1):.6f} | "
+                    f"SeqID L1: {running['seqid'] / max(steps, 1):.6f} | "
+                    f"Grad norm: {running['grad_norm'] / max(steps, 1):.6f} | "
+                    f"LR: {self.optimizer.param_groups[0]['lr']:.8f}"
                 )
 
-                msg = (
-                    f"Self-hit rate before filtering: {self_hit_rate:.4f}\n"
-                    f"Average Top-1 Remote homologous score: {avg_top1_score:.6f}\n"
-                    f"Average Top-{self.config.topk} Remote homologous score: {avg_topk_score:.6f}\n"
-                    f"Average Top-1 TM-score: {avg_top1_tm:.6f}\n"
-                    f"Average Top-1 SeqID: {avg_top1_seqid:.6f}"
-                )
-                print(msg)
-                self.log_file.write(msg + "\n")
+                self._log("======================================================================")
+                if (epoch+1) % 10 == 0:
+                    self._log("======================= Test =======================")
 
-                if avg_top1_score > self.max_top1:
-                    self.max_top1 = avg_top1_score
-                    save_model(self.model, self.config.model_name + "_best_top1", epoch)
+                    embs_lib = gen_embeddings(self.model, lib_loader, self.device, mode="cand")
+                    embs_test = gen_embeddings(self.model, test_loader, self.device, mode="query")
+                    search_k = max(self.config.topk + 1, self.config.eval_search_k)
+                    I, _ = build_idx(embs_lib, embs_test, topk=search_k)
+                    I_filtered, self_hit_rate = self._filter_self_hits(I, test_map, datalib.map)
+                    sorted_results, avg_top1_score, avg_topk_score, avg_top1_tm, avg_top1_seqid = calculate_remote_homology_score(
+                        query=test_set,
+                        database=datalib,
+                        idx=I_filtered,
+                        k=self.config.topk,
+                        pdb_root=self.config.pdb_root,
+                        tmalign_path=self.config.tmalign_path,
+                        reference=self.config.tmalign_reference,
+                        num_workers=self.config.tmalign_workers,
+                    )
+                    msg = (
+                        f"Self-hit rate before filtering: {self_hit_rate:.4f}\n"
+                        f"Average Top-1 Remote homologous score: {avg_top1_score:.6f}\n"
+                        f"Average Top-{self.config.topk} Remote homologous score: {avg_topk_score:.6f}\n"
+                        f"Average Top-1 TM-score: {avg_top1_tm:.6f}\n"
+                        f"Average Top-1 SeqID: {avg_top1_seqid:.6f}"
+                    )
+                    self._log(msg)
+                    if avg_top1_score > self.max_top1_score or avg_topk_score > self.max_topk_score:
+                        self.max_top1_score = max(self.max_top1_score, avg_top1_score)
+                        self.max_topk_score = max(self.max_topk_score, avg_topk_score)
+                        # save_model(self.model, self.config.save_path + self.config.model_name + '.pth')
 
-                if avg_topk_score > self.max_topk:
-                    self.max_topk = avg_topk_score
-                    save_model(self.model, self.config.model_name + "_best_topk", epoch)
-
-                print("======================================================================")
         finally:
             self.close()
 
 
 if __name__ == "__main__":
     start_time = datetime.now()
-    config = TrainConfig()
+    config = parse_args()
+
     pt.cuda.set_device(config.gpu)
 
-    print('loading data')
-    data = pt.load('./data/sorted_1300_p0_h0.pt', weights_only=False)
-    whole_data = ProteinDataset(data, mode='cand')
-    whole_map = np.arange(len(whole_data), dtype=np.int64)
+    print("loading data")
+    data = pt.load(config.data_path, weights_only=False)
 
-    print('number of whole data: ', len(whole_map))
-    lib_map, test_map = train_test_split(whole_map, test_size=1024, random_state=42)
-    lib_map = np.sort(lib_map)
+    lib_data = ProteinDataset(data, mode="cand")
+    lib_map = np.arange(len(lib_data), dtype=np.int64)
+    pdb2idx = {str(lib_data[i]["lab"]): i for i in range(len(lib_map))}
+    print("number of library proteins:", len(lib_data))
 
-    print('number of library proteins:', len(lib_map))
+    queryhomo = QueryHomologyDataset(None, config.pair_file, pdb2idx)
+    train_map = np.arange(len(queryhomo), dtype=np.int64)
+    train_map, test_map = train_test_split(
+        train_map,
+        test_size=config.test_size,
+        random_state=config.random_state
+    )
     test_map = np.sort(test_map)
-    print('Test query num:', len(test_map))
 
-    datalib = ProteinDataset(whole_data, mapping=lib_map, mode='cand')
-    test_set = ProteinDataset(whole_data, mapping=test_map, mode='query')
+    train_set = QueryHomologyDataset(queryhomo, mapping=train_map)
+    test_set = QueryHomologyDataset(queryhomo, mapping=test_map)
 
-    pdb2idx = {datalib[i]['lab']: i for i in range(len(lib_map))}
-    query_homo_data = QueryHomologyDataset(datalib, './data/tmalign.out', pdb2idx)
-    print('Query_i homology_ij pair num:', len(query_homo_data))
+    print("Train query-group num:", len(train_set))
+    print("Test query num:", len(test_set))
 
-    batch_size = config.batch_size
+    test_global_idx = np.array(
+        [int(test_set[i]["idx1"]) for i in range(len(test_set))],
+        dtype=np.int64
+    )
 
-    libloader = DataLoader(
-        datalib,
-        batch_size=max(batch_size // 2, 1),
+    lib_loader = DataLoader(
+        lib_data,
+        batch_size=config.eval_batch_size,
         shuffle=False,
         num_workers=config.num_workers,
-        collate_fn=collate_fun_emb(mode='cand'),
+        collate_fn=collate_fun_emb(mode="cand"),
         pin_memory=True,
         drop_last=False,
     )
 
     train_loader = DataLoader(
-        query_homo_data,
-        batch_size=batch_size,
+        train_set,
+        batch_size=config.batch_size,
         shuffle=True,
         num_workers=config.num_workers,
-        collate_fn=collate_fun_train(
-            datalib,
-            mode=config.train_sample_mode,
-            top_m=config.train_top_m,
-            temperature=config.train_sample_temperature,
-            num_pos=config.train_num_pos,
-            strata_boundaries=config.strata_boundaries,
-        ),
-        pin_memory=True,
-        drop_last=True,
-    )
-
-    test_loader = DataLoader(
-        test_set,
-        batch_size=max(batch_size // 2, 1),
-        shuffle=False,
-        num_workers=config.num_workers,
-        collate_fn=collate_fun_emb(mode='query'),
+        collate_fn=collate_fun_train(lib_data),
         pin_memory=True,
         drop_last=False,
     )
 
+    test_loader = DataLoader(
+        test_set,
+        batch_size=config.eval_batch_size,
+        shuffle=False,
+        num_workers=config.num_workers,
+        collate_fn=collate_fun_emb(mode="query", protein_dataset=lib_data),
+        pin_memory=True,
+        drop_last=False,
+    )
+
+    sample_graph = lib_data[0]["graph"]
+    device = pt.device(f"cuda:{config.gpu}" if pt.cuda.is_available() else "cpu")
+
     model = DualEncoderRetriever(
         vocab_size=21,
-        node_feat_dim=whole_data[0]['graph'].x.shape[1],
-        edge_feat_dim=whole_data[0]['graph'].edge_attr.shape[1],
-        query_num_layers=config.query_num_layers,
-        gnn_num_layers=config.gnn_num_layers,
-        rank_target_temperature=config.rank_target_temperature,
-        rank_pred_temperature=config.rank_pred_temperature,
-        lambda_pull=config.lambda_pull,
-        lambda_var=config.lambda_var,
-        lambda_cov=config.lambda_cov,
-        variance_gamma=config.variance_gamma,
-    ).cuda(config.gpu)
+        node_feat_dim=sample_graph.x.shape[1],
+        edge_feat_dim=sample_graph.edge_attr.shape[1],
+    ).to(device)
 
     trainer = Trainer(model, config)
     trainer.train(
         train_loader=train_loader,
         test_loader=test_loader,
-        lib_loader=libloader,
+        lib_loader=lib_loader,
+        test_map=test_global_idx,
         test_set=test_set,
-        datalib=datalib,
-        test_map=test_map,
+        datalib=lib_data,
     )
 
     pt.cuda.empty_cache()
-    end_time = start_time.now()
-    print(f"whole time consuming: {end_time - start_time}")
+    print(f"whole time consuming: {datetime.now() - start_time}")

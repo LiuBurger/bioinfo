@@ -71,7 +71,7 @@ class QueryHomologyDataset(Dataset):
         super().__init__()
         if isinstance(dataset, ProteinDataset): # raw data
             assert pair_file is not None and pdb2idx is not None, "pair_file and pdb2idx must be provided for raw data."
-            df = pd.read_csv(pair_file, names=['name1', 'name2', 'tmscore', 'seqid'], delimiter='	')
+            df = pd.read_csv(pair_file, names=['name1', 'name2', 'tmscore', 'seqid'], delimiter='\t')
             df['name1'] = df['name1'].str.split('/').str[-1].str.removesuffix('.pdb')
             df['name2'] = df['name2'].str.split('/').str[-1].str.removesuffix('.pdb')
             df['idx1'] = df['name1'].map(pdb2idx)
@@ -79,16 +79,14 @@ class QueryHomologyDataset(Dataset):
             df = df.dropna(subset=['idx1', 'idx2'])
             df['idx1'] = df['idx1'].astype(np.int64)
             df['idx2'] = df['idx2'].astype(np.int64)
-            # score = tmscore - 0.6 + min(0, 0.4 - seqid)
-            df['score'] = df['tmscore'] - 0.6 + np.minimum(0.0, 0.4 - df['seqid'])
-            # 先按 idx1 分组，再按 score 降序排列
+            # 按 idx1 分组
             grouped = []
             for idx1, g in df.groupby('idx1', sort=False):
-                g = g.sort_values('score', ascending=False, kind='mergesort')
                 grouped.append({
                     'idx1': int(idx1),
                     'idx2_list': g['idx2'].to_numpy(dtype=np.int64).tolist(),
-                    'score_list': pt.from_numpy(g['score'].to_numpy(dtype=np.float32)),
+                    'tmscore_list': pt.from_numpy(g['tmscore'].to_numpy(dtype=np.float32)),
+                    'seqid_list': pt.from_numpy(g['seqid'].to_numpy(dtype=np.float32)),
                 })
             self.groups = grouped
             self.map = np.arange(len(self.groups), dtype=np.int64) if mapping is None else mapping.astype(np.int64)
@@ -100,77 +98,67 @@ class QueryHomologyDataset(Dataset):
 
     def __getitem__(self, idx):
         g = self.groups[self.map[idx]]
-        data = {}
-        data['idx1'], data['idx2_list'], data['score_list'] = g['idx1'], g['idx2_list'], g['score_list']
+        data = {'idx1':g['idx1'], 'idx2_list':g['idx2_list'], 'tmscore_list':g['tmscore_list'], 'seqid_list':g['seqid_list']}
         return data
 
     def __len__(self):
         return len(self.map)
 
 
-def collate_fun_train(protein_dataset, mode:str='weight', top_m:int=16, temperature:float=0.05):
-    """
-    batch item:
-        idx1 : query index
-        idx2_list : list[candidate index]
-        score_list : tensor
-    """
+def collate_fun_train(protein_dataset):
+    N = len(protein_dataset)
     def collate_fn(batch):
-        query_seqs, cand_seqs, cand_graphs, scores = [], [], [], []
+        query_seqs, pos_seqs, pos_graphs, tmscores, seqids, neg_seqs, neg_graphs = [], [], [], [], [], [], []
         for data in batch:
-            idx1, idx2_list, score_list = data['idx1'], data['idx2_list'], data['score_list']
+            idx1, idx2_list, tmscore_list, seqid_list = data['idx1'], data['idx2_list'], data['tmscore_list'], data['seqid_list']
             q_seq = protein_dataset[idx1]['seq']
-            query_seqs.append(q_seq)
+            query_seqs.append(q_seq)         
 
-            m = min(top_m, len(idx2_list)) if top_m is not None else len(idx2_list)
-            if m <= 0:
-                raise ValueError(f"No candidates found for query idx={idx1}")
-
-            if mode == 'random':
-                idx2_idx = random.randint(0, m - 1)
-            elif mode == 'weight':
-                scores_np = score_list[:m].detach().cpu().numpy().astype(np.float64)
-                logits = scores_np / max(temperature, 1e-8)
-                logits = logits - logits.max()
-                prob = np.exp(logits)
-                prob = prob / prob.sum()
-                idx2_idx = int(np.random.choice(m, p=prob))
-            else:
-                raise ValueError(f"Invalid mode: {mode}. Must be one of 'random' or 'weight'.")
-
-            score = float(score_list[idx2_idx])
-            scores.append(score)
-            cand_idx = int(idx2_list[idx2_idx])
-            c_seq = protein_dataset[cand_idx]['seq']
-            cand_seqs.append(c_seq)
-            c_graph = protein_dataset[cand_idx]['graph']
-            cand_graphs.append(c_graph)
+            idx2_idx = random.randint(0, len(idx2_list)-1)
+            pos_seq = protein_dataset[idx2_list[idx2_idx]]['seq']
+            pos_graph = protein_dataset[idx2_list[idx2_idx]]['graph']
+            tmscore = float(tmscore_list[idx2_idx])
+            seqid = float(seqid_list[idx2_idx])
+            
+            pos_seqs.append(pos_seq)
+            pos_graphs.append(pos_graph)
+            tmscores.append(tmscore)
+            seqids.append(seqid)
+            
+            neg_idx = random.randint(0, N-1)
+            while neg_idx in idx2_list or neg_idx == idx1:
+                neg_idx = random.randint(0, N-1)
+            neg_seq = protein_dataset[neg_idx]['seq']
+            neg_graph = protein_dataset[neg_idx]['graph']
+            neg_seqs.append(neg_seq)
+            neg_graphs.append(neg_graph)
 
         query_seqs = pad_sequence(query_seqs, batch_first=True)
-        cand_seqs = pad_sequence(cand_seqs, batch_first=True)
-        query_mask = (query_seqs != 0).long()
-        cand_mask = (cand_seqs != 0).long()
-        cand_graphs = Batch.from_data_list(cand_graphs)
-        scores = pt.tensor(scores, dtype=pt.float32)
+        query_masks = (query_seqs != 0).long()
+        pos_seqs = pad_sequence(pos_seqs, batch_first=True)
+        pos_masks = (pos_seqs != 0).long()
+        pos_graphs = Batch.from_data_list(pos_graphs)        
+        tmscores = pt.tensor(tmscores, dtype=pt.float32)
+        seqids = pt.tensor(seqids, dtype=pt.float32)
+
+        neg_seqs = pad_sequence(neg_seqs, batch_first=True)
+        neg_masks = (neg_seqs != 0).long()
+        neg_graphs = Batch.from_data_list(neg_graphs)
+        
         return {
             "query_seqs": query_seqs,
-            "query_masks": query_mask,
-            "cand_seqs": cand_seqs,
-            "cand_masks": cand_mask,
-            "cand_graphs": cand_graphs,
-            "scores": scores,
+            "query_masks": query_masks,
+            "pos_seqs": pos_seqs,
+            "pos_masks": pos_masks,
+            "pos_graphs": pos_graphs,
+            "tmscores": tmscores,
+            "seqids": seqids,
+            "neg_seqs": neg_seqs,
+            "neg_masks": neg_masks,
+            "neg_graphs": neg_graphs,
         }
 
     return collate_fn
-
-
-# def collate_fun_emb(batch):
-#     seqs_pad = []
-#     for seq, _ in batch: # seq, graph, lab
-#         seqs_pad.append(seq)
-#     seqs_pad = pad_sequence(seqs_pad, batch_first=True)
-#     masks = (seqs_pad != 0).long()
-#     return seqs_pad, masks
 
 
 def collate_fun_emb(mode:str='query'):
