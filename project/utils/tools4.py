@@ -12,15 +12,15 @@ from torch.utils.data import DataLoader
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
-
 @pt.no_grad()
 def gen_embeddings(model: nn.Module, loader: DataLoader, gpu: int, mode: str = 'query'):
     embs = []
     model.eval()
+    device = pt.device(f'cuda:{gpu}' if pt.cuda.is_available() else 'cpu')
     for data in loader:
         data_gpu = {}
         for k, v in data.items():
-            data_gpu[k] = v.to(gpu, non_blocking=True) if hasattr(v, 'to') else v
+            data_gpu[k] = v.to(device, non_blocking=True) if hasattr(v, 'to') else v
         emb = model.encode(data_gpu, mode).detach().cpu().numpy().astype(np.float32)
         embs.append(emb)
     if len(embs) == 0:
@@ -32,25 +32,17 @@ def gen_embeddings(model: nn.Module, loader: DataLoader, gpu: int, mode: str = '
     return embs
 
 
-def faiss_idx(embs_lib: np.ndarray, gpu: int):
-    res = faiss.StandardGpuResources()
-    index_flat = faiss.IndexFlatL2(embs_lib.shape[1])
-    index_flat = faiss.index_cpu_to_gpu(res, gpu, index_flat)
-    index_flat.add(embs_lib.astype('float32'))
-    return index_flat
-
-
 def build_idx(embs_lib: np.ndarray, embs_query: np.ndarray, topk: int = 200, keep_index: bool = False):
     assert embs_lib.shape[1] == embs_query.shape[1], 'Dimension not match'
-    index_flat = faiss.IndexFlatL2(embs_lib.shape[1])
+    index_flat = faiss.IndexFlatIP(embs_lib.shape[1])
     index_flat.add(embs_lib.astype('float32'))
     time_start = datetime.now()
-    distance, indices = index_flat.search(embs_query.astype('float32'), topk)
+    scores, indices = index_flat.search(embs_query.astype('float32'), topk)
     print('faiss cpu searching time:', datetime.now() - time_start)
     if not keep_index:
         index_flat.reset()
     pt.cuda.empty_cache()
-    return indices, distance
+    return indices, scores
 
 
 def save_model(model: nn.Module, save_path: str):
@@ -59,7 +51,7 @@ def save_model(model: nn.Module, save_path: str):
 
 
 def make_pdb_path(pdb_root, pdb_name: str) -> Path:
-    return Path(pdb_root) / pdb_name[1:3] / f"{pdb_name}.pdb"
+    return Path(pdb_root) / pdb_name[1:3] / f'{pdb_name}.pdb'
 
 
 def generate_tasks(
@@ -91,12 +83,12 @@ def run_tmalign(task):
     cmd = [str(tmalign_path), str(pdb1), str(pdb2)]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        cmd_str = " ".join(cmd)
+        cmd_str = ' '.join(cmd)
         raise RuntimeError(
-            f"TMalign failed.\n"
-            f"cmd: {cmd_str}\n"
-            f"returncode: {result.returncode}\n"
-            f"stderr: {result.stderr}"
+            f'TMalign failed.\n'
+            f'cmd: {cmd_str}\n'
+            f'returncode: {result.returncode}\n'
+            f'stderr: {result.stderr}'
         )
     output = result.stdout
     seqid_match = re.search(r'Seq_ID=.*?=\s*([0-9.]+)', output)
