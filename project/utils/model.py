@@ -53,7 +53,7 @@ class SequenceTransformer(nn.Module):
         num_heads: int = 8,
         num_layers: int = 1,
         dropout: float = 0.1,
-        max_seq_len: int = 4096,
+        max_seq_len: int = 2048,
     ):
         super().__init__()
         if model_dim % num_heads != 0:
@@ -111,7 +111,6 @@ class SharedSeqGraphEncoder(nn.Module):
     3) 与图节点特征直接拼接
     4) 经过 3 层 GINE, GNN hidden_dim = seq_dim + node_feat_dim
     5) attention pooling 得到图级表示
-
     返回：
     - seq_global: [B, seq_dim]
     - graph_global: [B, graph_hidden_dim]
@@ -126,7 +125,7 @@ class SharedSeqGraphEncoder(nn.Module):
         transformer_num_layers: int = 1,
         transformer_heads: int = 8,
         dropout: float = 0.1,
-        max_seq_len: int = 4096,
+        max_seq_len: int = 2048,
         attn_gate_hidden: int = None,
     ):
         super().__init__()
@@ -245,7 +244,7 @@ class DualEncoderRetriever(nn.Module):
         gnn_num_layers: int = 3,
         transformer_num_layers: int = 1,
         transformer_heads: int = 8,
-        max_seq_len: int = 4096,
+        max_seq_len: int = 2048,
         dropout: float = 0.1,
         normalize: bool = True,
         temperature: float = 0.07,

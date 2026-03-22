@@ -107,7 +107,7 @@ class QueryHomologyDataset(Dataset):
 
 def collate_fun_train(protein_dataset: ProteinDataset, positive_top_ratio: float = 0.3):
     """
-    每个 query 抽一个正样本；batch 内其余正样本自动构成 in-batch negatives。
+    每个 query 抽一个正样本; batch 内其余正样本自动构成 in-batch negatives.
     监督同时返回：
     - seqids: 用于 SEQID 回归
     - tmscores: 用于 tmscore 回归
@@ -174,11 +174,9 @@ def collate_fun_train(protein_dataset: ProteinDataset, positive_top_ratio: float
 
 def collate_fun_emb(mode: str = 'query', protein_dataset: ProteinDataset = None):
     """
-    注意：虽然模型端已经统一成单一 encode 函数，这里的数据拼装仍然保留
-    query / candidate 区分，因为两者的 dataset 结构不同：
-
-    - query: batch 元素来自 QueryHomologyDataset，需要通过 idx1 去 protein_dataset 取真实样本
-    - cand : batch 元素直接来自 ProteinDataset，可直接取 seq / graph
+    query / candidate 区分, 因为两者的 dataset 结构不同：
+    - query: batch 元素来自 QueryHomologyDataset, 需要通过 idx1 去 protein_dataset 取真实样本
+    - cand : batch 元素直接来自 ProteinDataset, 可直接取 seq / graph
     """
     if mode == 'query':
         assert protein_dataset is not None, 'As query, ProteinDataset must be provided.'

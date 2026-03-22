@@ -42,7 +42,7 @@ def parse_args():
     parser.add_argument('--gnn_num_layers', type=int, default=3)
     parser.add_argument('--transformer_num_layers', type=int, default=1)
     parser.add_argument('--transformer_heads', type=int, default=8)
-    parser.add_argument('--max_seq_len', type=int, default=4096)
+    parser.add_argument('--max_seq_len', type=int, default=2048)
     parser.add_argument('--dropout', type=float, default=0.1)
     parser.add_argument('--normalize', action='store_true', default=True)
     parser.add_argument('--no_normalize', action='store_false', dest='normalize')
@@ -71,11 +71,11 @@ def parse_args():
     parser.add_argument('--no_save_last', action='store_false', dest='save_last')
 
     # paths
-    parser.add_argument('--data_path', type=str, default='./data/sorted_1300_p0_h0.pt')
+    parser.add_argument('--data_path', type=str, default='./data/sorted_1300_p0_h1.pt')
     parser.add_argument('--pdb_root', type=str, default='../../data/pdb')
     parser.add_argument('--tmalign_path', type=str, default='./TMalign')
     parser.add_argument('--pair_file', type=str, default='./data/tmalign.out')
-    parser.add_argument('--model_name', type=str, default='SharedTransformerGINE_AttnPool_TMscore')
+    parser.add_argument('--model_name', type=str, default='TransGINE_AttnPool_TMscore_p0h1')
 
     return parser.parse_args()
 
@@ -85,7 +85,7 @@ class Trainer:
         self.model = model
         self.config = config
         self.device = pt.device(f'cuda:{config.gpu}' if pt.cuda.is_available() else 'cpu')
-        self.log_file = open(f'{config.model_name}.txt', 'w', encoding='utf-8')
+        self.log_file = open(f'./log/{config.model_name}.txt', 'w', encoding='utf-8')
         self.optimizer = MultiTaskOptimizer(
             ranker=self.model,
             lr=config.lr,
