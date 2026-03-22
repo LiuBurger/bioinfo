@@ -2,13 +2,13 @@ import h5py
 import random
 import torch as pt
 import numpy as np
-from torch.utils.data import Dataset
 import pandas as pd
+from torch.utils.data import Dataset
 from torch.nn.utils.rnn import pad_sequence
 from torch_geometric.data import Batch
 
 
-def load(fn, mode:str='all'):
+def load(fn, mode: str = 'all'):
     with h5py.File(fn) as f:
         seq = f['node_seq'][()].astype(np.int32)
         node_idx = f['node_idx'][()]
@@ -22,55 +22,50 @@ def load(fn, mode:str='all'):
             edge_idx = f['edge_idx'][()]
         if mode in ['part', 'seq']:
             lab = f['label'][()]
-        f.close()
     if mode == 'all':
         return seq, node_ss, node_rsa, node_pos, node_idx, edge_nho, edge_idx, lab
-    elif mode == 'part':
+    if mode == 'part':
         return seq, node_pos, node_idx, edge_nho, edge_idx, lab
-    elif mode == 'seq':
+    if mode == 'seq':
         return seq, node_idx, lab
-    else:
-        raise ValueError(f"Invalid mode: {mode}. Must be one of 'all', 'part', or 'seq'.")
+    raise ValueError(f"Invalid mode: {mode}. Must be one of 'all', 'part', or 'seq'.")
 
 
 class ProteinDataset(Dataset):
-    def __init__(self, dataset, mapping:np.ndarray=None, mode:str='query'):
+    def __init__(self, dataset, mapping: np.ndarray = None, mode: str = 'graph'):
         super().__init__()
         self.mode = mode
-        if isinstance(dataset, tuple): # raw data
+        if isinstance(dataset, tuple):
             self.seq = dataset[0]
             self.lab = dataset[1]
-            if mode == 'cand':
-                self.graph = dataset[2]
-            self.map = np.arange(len(self.lab), dtype=np.int64) # 恒等映射
-            assert len(self.seq) == len(self.lab)
-        else: # structured data
-            assert mapping is not None, "Mapping must be provided for structured data."
+            self.graph = dataset[2]
+            self.map = np.arange(len(self.lab), dtype=np.int64)
+            assert len(self.seq) == len(self.lab) == len(self.graph)
+        else:
+            assert mapping is not None or hasattr(dataset, 'lab'), "dataset must provide `lab`."
             self.seq = dataset.seq
             self.lab = dataset.lab
-            if mode == 'cand':
-                self.graph = dataset.graph
-            self.map = mapping
+            self.graph = dataset.graph
+            self.map = mapping if mapping is not None else np.arange(len(self.lab), dtype=np.int64)
             assert np.max(self.map) < len(self.lab)
-    # self.map旨在维护一个data子集的映射，数据仍然是全部数据
 
     def __getitem__(self, idx):
         idx = self.map[idx]
-        data = {}
-        data['seq'], data['lab'] = self.seq[idx], self.lab[idx]
-        if self.mode == 'cand':
-            data["graph"] = self.graph[idx]
-        return data
+        return {
+            'seq': self.seq[idx],
+            'lab': self.lab[idx],
+            'graph': self.graph[idx],
+        }
 
     def __len__(self):
-        return len(self.map) #子集的大小是map的大小
+        return len(self.map)
 
 
 class QueryHomologyDataset(Dataset):
-    def __init__(self, dataset, pair_file:str=None, pdb2idx:dict=None, mapping:np.ndarray=None):
+    def __init__(self, dataset=None, pair_file: str = None, pdb2idx: dict = None, mapping: np.ndarray = None):
         super().__init__()
-        if isinstance(dataset, ProteinDataset): # raw data
-            assert pair_file is not None and pdb2idx is not None, "pair_file and pdb2idx must be provided for raw data."
+        if dataset is None:
+            assert pair_file is not None and pdb2idx is not None, 'pair_file and pdb2idx must be provided for raw data.'
             df = pd.read_csv(pair_file, names=['name1', 'name2', 'tmscore', 'seqid'], delimiter='\t')
             df['name1'] = df['name1'].str.split('/').str[-1].str.removesuffix('.pdb')
             df['name2'] = df['name2'].str.split('/').str[-1].str.removesuffix('.pdb')
@@ -79,7 +74,7 @@ class QueryHomologyDataset(Dataset):
             df = df.dropna(subset=['idx1', 'idx2'])
             df['idx1'] = df['idx1'].astype(np.int64)
             df['idx2'] = df['idx2'].astype(np.int64)
-            # 按 idx1 分组
+
             grouped = []
             for idx1, g in df.groupby('idx1', sort=False):
                 grouped.append({
@@ -90,93 +85,126 @@ class QueryHomologyDataset(Dataset):
                 })
             self.groups = grouped
             self.map = np.arange(len(self.groups), dtype=np.int64) if mapping is None else mapping.astype(np.int64)
-        else: # structured data
-            assert hasattr(dataset, 'groups'), "For structured data, dataset must already contain grouped data in `dataset.groups`."
+        elif isinstance(dataset, QueryHomologyDataset):
             self.groups = dataset.groups
             self.map = mapping.astype(np.int64) if mapping is not None else np.arange(len(self.groups), dtype=np.int64)
-            assert np.max(self.map) < len(self.groups), "mapping index out of range."
+            assert np.max(self.map) < len(self.groups), 'mapping index out of range.'
+        else:
+            raise TypeError('dataset must be None or QueryHomologyDataset')
 
     def __getitem__(self, idx):
         g = self.groups[self.map[idx]]
-        data = {'idx1':g['idx1'], 'idx2_list':g['idx2_list'], 'tmscore_list':g['tmscore_list'], 'seqid_list':g['seqid_list']}
-        return data
+        return {
+            'idx1': g['idx1'],
+            'idx2_list': g['idx2_list'],
+            'tmscore_list': g['tmscore_list'],
+            'seqid_list': g['seqid_list'],
+        }
 
     def __len__(self):
         return len(self.map)
 
 
-def collate_fun_train(protein_dataset):
-    N = len(protein_dataset)
-    def collate_fn(batch):
-        query_seqs, pos_seqs, pos_graphs, tmscores, seqids, neg_seqs, neg_graphs = [], [], [], [], [], [], []
-        for data in batch:
-            idx1, idx2_list, tmscore_list, seqid_list = data['idx1'], data['idx2_list'], data['tmscore_list'], data['seqid_list']
-            q_seq = protein_dataset[idx1]['seq']
-            query_seqs.append(q_seq)         
+def collate_fun_train(protein_dataset: ProteinDataset, positive_top_ratio: float = 0.3):
+    """
+    每个 query 抽一个正样本；batch 内其余正样本自动构成 in-batch negatives。
+    监督同时返回：
+    - seqids: 用于 SEQID 回归
+    - tmscores: 用于 tmscore 回归
+    - remote_scores: 仅用于日志或兼容保留
+    """
+    positive_top_ratio = float(max(0.0, min(1.0, positive_top_ratio)))
 
-            idx2_idx = random.randint(0, len(idx2_list)-1)
-            pos_seq = protein_dataset[idx2_list[idx2_idx]]['seq']
-            pos_graph = protein_dataset[idx2_list[idx2_idx]]['graph']
-            tmscore = float(tmscore_list[idx2_idx])
-            seqid = float(seqid_list[idx2_idx])
-            
-            pos_seqs.append(pos_seq)
-            pos_graphs.append(pos_graph)
-            tmscores.append(tmscore)
-            seqids.append(seqid)
-            
-            neg_idx = random.randint(0, N-1)
-            while neg_idx in idx2_list or neg_idx == idx1:
-                neg_idx = random.randint(0, N-1)
-            neg_seq = protein_dataset[neg_idx]['seq']
-            neg_graph = protein_dataset[neg_idx]['graph']
-            neg_seqs.append(neg_seq)
-            neg_graphs.append(neg_graph)
+    def collate_fn(batch):
+        query_seqs, pos_seqs = [], []
+        query_graphs, pos_graphs = [], []
+        tmscores, seqids, remote_scores = [], [], []
+
+        for data in batch:
+            idx1 = data['idx1']
+            idx2_list = data['idx2_list']
+            tmscore_list = data['tmscore_list']
+            seqid_list = data['seqid_list']
+
+            query_item = protein_dataset[idx1]
+            query_seqs.append(query_item['seq'])
+            query_graphs.append(query_item['graph'])
+
+            score_list = tmscore_list - 0.6 + pt.minimum(0.4 - seqid_list, pt.zeros_like(seqid_list))
+            if len(idx2_list) == 1 or positive_top_ratio <= 0.0:
+                idx2_idx = int(pt.argmax(score_list).item())
+            else:
+                topm = max(1, int(np.ceil(len(idx2_list) * positive_top_ratio)))
+                top_idx = pt.topk(score_list, k=topm).indices
+                rand_pos = random.randrange(topm)
+                idx2_idx = int(top_idx[rand_pos].item())
+
+            pos_idx = idx2_list[idx2_idx]
+            pos_item = protein_dataset[pos_idx]
+            pos_seqs.append(pos_item['seq'])
+            pos_graphs.append(pos_item['graph'])
+
+            tm_value = float(tmscore_list[idx2_idx])
+            seqid_value = float(seqid_list[idx2_idx])
+            remote_value = tm_value - 0.6 + min(0.4 - seqid_value, 0.0)
+
+            tmscores.append(tm_value)
+            seqids.append(seqid_value)
+            remote_scores.append(remote_value)
 
         query_seqs = pad_sequence(query_seqs, batch_first=True)
         query_masks = (query_seqs != 0).long()
         pos_seqs = pad_sequence(pos_seqs, batch_first=True)
         pos_masks = (pos_seqs != 0).long()
-        pos_graphs = Batch.from_data_list(pos_graphs)        
-        tmscores = pt.tensor(tmscores, dtype=pt.float32)
-        seqids = pt.tensor(seqids, dtype=pt.float32)
 
-        neg_seqs = pad_sequence(neg_seqs, batch_first=True)
-        neg_masks = (neg_seqs != 0).long()
-        neg_graphs = Batch.from_data_list(neg_graphs)
-        
         return {
-            "query_seqs": query_seqs,
-            "query_masks": query_masks,
-            "pos_seqs": pos_seqs,
-            "pos_masks": pos_masks,
-            "pos_graphs": pos_graphs,
-            "tmscores": tmscores,
-            "seqids": seqids,
-            "neg_seqs": neg_seqs,
-            "neg_masks": neg_masks,
-            "neg_graphs": neg_graphs,
+            'query_seqs': query_seqs,
+            'query_masks': query_masks,
+            'query_graphs': Batch.from_data_list(query_graphs),
+            'pos_seqs': pos_seqs,
+            'pos_masks': pos_masks,
+            'pos_graphs': Batch.from_data_list(pos_graphs),
+            'tmscores': pt.tensor(tmscores, dtype=pt.float32),
+            'seqids': pt.tensor(seqids, dtype=pt.float32),
+            'remote_scores': pt.tensor(remote_scores, dtype=pt.float32),
         }
 
     return collate_fn
 
 
-def collate_fun_emb(mode:str='query'):
-    def collate_fun(batch):
-        seqs_pad = []
-        data = {}
-        for b in batch:
-            seqs_pad.append(b['seq'])
-        seqs_pad = pad_sequence(seqs_pad, batch_first=True)
-        masks = (seqs_pad != 0).long()
-        data['seqs_pad'] = seqs_pad
-        data['masks'] = masks
-        if mode == 'cand':
-            graphs = []
-            for b in batch:    
+def collate_fun_emb(mode: str = 'query', protein_dataset: ProteinDataset = None):
+    """
+    注意：虽然模型端已经统一成单一 encode 函数，这里的数据拼装仍然保留
+    query / candidate 区分，因为两者的 dataset 结构不同：
+
+    - query: batch 元素来自 QueryHomologyDataset，需要通过 idx1 去 protein_dataset 取真实样本
+    - cand : batch 元素直接来自 ProteinDataset，可直接取 seq / graph
+    """
+    if mode == 'query':
+        assert protein_dataset is not None, 'As query, ProteinDataset must be provided.'
+
+    def collate_fn(batch):
+        seqs = []
+        graphs = []
+
+        if mode == 'query':
+            for b in batch:
+                item = protein_dataset[b['idx1']]
+                seqs.append(item['seq'])
+                graphs.append(item['graph'])
+        elif mode == 'cand':
+            for b in batch:
+                seqs.append(b['seq'])
                 graphs.append(b['graph'])
-            graphs = Batch.from_data_list(graphs)
-            data['graphs'] = graphs
-        
-        return data
-    return collate_fun
+        else:
+            raise ValueError("mode must be either 'query' or 'cand'.")
+
+        seqs_pad = pad_sequence(seqs, batch_first=True)
+        masks = (seqs_pad != 0).long()
+        return {
+            'seqs_pad': seqs_pad,
+            'masks': masks,
+            'graphs': Batch.from_data_list(graphs),
+        }
+
+    return collate_fn

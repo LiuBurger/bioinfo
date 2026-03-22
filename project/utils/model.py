@@ -1,60 +1,9 @@
-import math
+from typing import Dict
+
 import torch as pt
 import torch.nn as nn
 import torch.nn.functional as F
 import torch_geometric.nn as gnn
-
-
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model: int, max_len: int = 2048):
-        super().__init__()
-        pe = pt.zeros(max_len, d_model)
-        position = pt.arange(0, max_len, dtype=pt.float).unsqueeze(1)
-        div_term = pt.exp(
-            pt.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)
-        )
-        pe[:, 0::2] = pt.sin(position * div_term)
-        pe[:, 1::2] = pt.cos(position * div_term)
-        self.register_buffer("pe", pe.unsqueeze(0))
-
-    def forward(self, x):
-        return x + self.pe[:, : x.size(1)]
-
-
-class SequenceEncoder(nn.Module):
-    def __init__(
-        self,
-        vocab_size: int,
-        d_model: int = 256,
-        nhead: int = 8,
-        num_layers: int = 1,
-        dropout: float = 0.1,
-        max_len: int = 1300,
-    ):
-        super().__init__()
-        self.token_embedding = nn.Embedding(vocab_size, d_model, padding_idx=0)
-        self.pos_embedding = PositionalEncoding(d_model, max_len=max_len)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=2*d_model,
-            dropout=dropout,
-            batch_first=True,
-            activation="gelu",
-            norm_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.norm = nn.LayerNorm(d_model)
-
-    def forward(self, input_ids, attention_mask):
-        x = self.token_embedding(input_ids)
-        x = self.pos_embedding(x)
-        key_padding_mask = (attention_mask == 0)
-        x = self.encoder(x, src_key_padding_mask=key_padding_mask)
-        x = self.norm(x)
-        mask = attention_mask.unsqueeze(-1).float()
-        pooled = (x * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
-        return pooled
 
 
 class GINEBackbone(nn.Module):
@@ -68,89 +17,221 @@ class GINEBackbone(nn.Module):
         super().__init__()
         self.edge_dim = edge_dim
         self.dropout = dropout
-        self.edge_encoder = (
-            nn.Linear(edge_dim, hidden_dim) if edge_dim != hidden_dim else nn.Identity()
-        )
+        self.edge_encoder = nn.Linear(edge_dim, hidden_dim) if edge_dim != hidden_dim else nn.Identity()
         self.convs = nn.ModuleList()
         self.norms = nn.ModuleList()
 
         for _ in range(num_layers):
             mlp = nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim),
+                nn.Linear(hidden_dim, 2 * hidden_dim),
+                nn.SiLU(),
+                nn.Dropout(dropout),
+                nn.Linear(2 * hidden_dim, hidden_dim),
             )
             conv = gnn.GINEConv(nn=mlp, train_eps=True, edge_dim=hidden_dim)
             self.convs.append(conv)
             self.norms.append(nn.LayerNorm(hidden_dim))
 
-    def forward(self, x, edge_idx, edge_attr=None, batch=None):
-        """
-        x: [N, in_dim]
-        edge_idx: [2, E]
-        edge_attr: [E, edge_dim]
-        """
+    def forward(self, x, edge_index, edge_attr=None):
         if edge_attr is None:
-            edge_attr = x.new_zeros(edge_idx.size(1), self.edge_dim)
+            edge_attr = x.new_zeros(edge_index.size(1), self.edge_dim)
         edge_attr = self.edge_encoder(edge_attr)
+
         for conv, norm in zip(self.convs, self.norms):
-            h = conv(x, edge_idx, edge_attr)
+            h = conv(x, edge_index, edge_attr)
             h = F.silu(h)
             h = F.dropout(h, p=self.dropout, training=self.training)
-            x = norm(x + h)  # residual
+            x = norm(x + h)
         return x
 
 
-class GraphEncoder(nn.Module):
+class SequenceTransformer(nn.Module):
+    def __init__(
+        self,
+        vocab_size: int,
+        model_dim: int,
+        num_heads: int = 8,
+        num_layers: int = 1,
+        dropout: float = 0.1,
+        max_seq_len: int = 4096,
+    ):
+        super().__init__()
+        if model_dim % num_heads != 0:
+            raise ValueError(f'model_dim ({model_dim}) must be divisible by num_heads ({num_heads}).')
+        self.model_dim = model_dim
+        self.max_seq_len = max_seq_len
+
+        self.token_embed = nn.Embedding(vocab_size, model_dim, padding_idx=0)
+        self.pos_embed = nn.Embedding(max_seq_len, model_dim)
+        self.embed_norm = nn.LayerNorm(model_dim)
+        self.embed_dropout = nn.Dropout(dropout)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=model_dim,
+            nhead=num_heads,
+            dim_feedforward=4 * model_dim,
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.out_norm = nn.LayerNorm(model_dim)
+
+    def forward(self, seq: pt.Tensor, mask: pt.Tensor):
+        bsz, seqlen = seq.shape
+        if seqlen > self.max_seq_len:
+            raise ValueError(
+                f'sequence length {seqlen} exceeds max_seq_len={self.max_seq_len}. '
+                f'Increase max_seq_len in model config.'
+            )
+
+        pos = pt.arange(seqlen, device=seq.device).unsqueeze(0).expand(bsz, seqlen)
+        x = self.token_embed(seq) + self.pos_embed(pos)
+        x = self.embed_norm(x)
+        x = self.embed_dropout(x)
+
+        key_padding_mask = (mask == 0)
+        x = self.encoder(x, src_key_padding_mask=key_padding_mask)
+        x = self.out_norm(x)
+        x = x * mask.unsqueeze(-1).float()
+        return x
+
+    @staticmethod
+    def masked_mean(x: pt.Tensor, mask: pt.Tensor) -> pt.Tensor:
+        denom = mask.sum(dim=1, keepdim=True).clamp_min(1).float()
+        return x.sum(dim=1) / denom
+
+
+class SharedSeqGraphEncoder(nn.Module):
+    """
+    共享主干：
+    1) 浅层 Transformer 先编码序列, seq_dim = hidden_dim
+    2) Transformer 输出通过 node2seq 对齐到节点
+    3) 与图节点特征直接拼接
+    4) 经过 3 层 GINE, GNN hidden_dim = seq_dim + node_feat_dim
+    5) attention pooling 得到图级表示
+
+    返回：
+    - seq_global: [B, seq_dim]
+    - graph_global: [B, graph_hidden_dim]
+    """
     def __init__(
         self,
         vocab_size: int,
         node_feat_dim: int,
         edge_feat_dim: int,
-        gnn_dim: int = 256,
+        hidden_dim: int = 512,
         gnn_num_layers: int = 3,
+        transformer_num_layers: int = 1,
+        transformer_heads: int = 8,
         dropout: float = 0.1,
+        max_seq_len: int = 4096,
+        attn_gate_hidden: int = None,
     ):
         super().__init__()
-        # 为了确保后续在gnn中维度整齐
-        self.seq_encoder = nn.Embedding(num_embeddings=vocab_size, 
-                                        embedding_dim=gnn_dim-node_feat_dim, padding_idx=0)
+        seq_dim = hidden_dim
+        graph_hidden_dim = seq_dim + node_feat_dim
+
+        if seq_dim % transformer_heads != 0:
+            raise ValueError(
+                f'seq_dim ({seq_dim}) must be divisible by transformer_heads ({transformer_heads}).'
+            )
+
+        self.seq_dim = seq_dim
+        self.graph_hidden_dim = graph_hidden_dim
+        self.node_feat_dim = node_feat_dim
+        self.edge_feat_dim = edge_feat_dim
+
+        self.seq_encoder = SequenceTransformer(
+            vocab_size=vocab_size,
+            model_dim=seq_dim,
+            num_heads=transformer_heads,
+            num_layers=transformer_num_layers,
+            dropout=dropout,
+            max_seq_len=max_seq_len,
+        )
         self.gnn = GINEBackbone(
-            hidden_dim=gnn_dim,
+            hidden_dim=graph_hidden_dim,
             edge_dim=edge_feat_dim,
             num_layers=gnn_num_layers,
             dropout=dropout,
         )
+        self.node_out_norm = nn.LayerNorm(graph_hidden_dim)
 
-    def forward(self, seq, mask, graph):
-        """
-        seq: [B, L]
-        mask: [B, L]
-        graph:
-          - x: [N, Fx]
-          - edge_index: [2, E]
-          - edge_attr: [E, Fe]
-          - batch: [N]
-          - node2seq: [N]
-        """
+        gate_hidden = attn_gate_hidden if attn_gate_hidden is not None else max(32, graph_hidden_dim // 2)
+        self.attn_pool = gnn.AttentionalAggregation(
+            gate_nn=nn.Sequential(
+                nn.Linear(graph_hidden_dim, gate_hidden),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(gate_hidden, 1),
+            )
+        )
+        self.graph_out_norm = nn.LayerNorm(graph_hidden_dim)
+
+    def forward(self, seq: pt.Tensor, mask: pt.Tensor, graph):
         x = graph.x.float()
-        edge_idx = graph.edge_index
-        edge_attr = graph.edge_attr.float()
+        edge_index = graph.edge_index
+        edge_attr = graph.edge_attr.float() if getattr(graph, 'edge_attr', None) is not None else None
         batch = graph.batch
+
+        if not hasattr(graph, 'node2seq'):
+            raise ValueError('graph must contain `node2seq` for sequence-to-node alignment.')
         node2seq = graph.node2seq.long()
-        # [B, L, D]
-        emb = self.seq_encoder(seq)
-        emb = emb * mask.unsqueeze(-1).float()
-        B, L, D = emb.shape
-        if node2seq.min() < 0 or node2seq.max() >= L:
-            raise ValueError(f"node2seq out of range: min={node2seq.min().item()}, max={node2seq.max().item()}, L={L}")
-        emb_flat = emb.reshape(B * L, D)
-        # 第 k 个节点对应到 batch[k] 这个图里的 node2seq[k] 位置
-        flat_idx = batch * L + node2seq
-        node_emb = emb_flat[flat_idx]  # [N, D]
-        # 拼接节点属性
-        x = pt.cat([node_emb, x], dim=-1)  # [N, D + Fx]
-        x = self.gnn(x, edge_idx, edge_attr=edge_attr, batch=batch)
-        x = gnn.global_mean_pool(x, batch)  # [B, hidden_dim]
-        return x
+
+        seq_out = self.seq_encoder(seq, mask)
+        seq_global = SequenceTransformer.masked_mean(seq_out, mask)
+
+        bsz, seqlen, d_model = seq_out.shape
+        if node2seq.numel() > 0 and (node2seq.min() < 0 or node2seq.max() >= seqlen):
+            raise ValueError(
+                f'node2seq out of range: min={node2seq.min().item()}, '
+                f'max={node2seq.max().item()}, L={seqlen}'
+            )
+
+        seq_flat = seq_out.reshape(bsz * seqlen, d_model)
+        flat_idx = batch * seqlen + node2seq
+        node_seq_feat = seq_flat[flat_idx]
+
+        x = pt.cat([node_seq_feat, x], dim=-1)
+        x = self.gnn(x, edge_index, edge_attr=edge_attr)
+        x = self.node_out_norm(x)
+
+        graph_global = self.attn_pool(x, batch)
+        graph_global = self.graph_out_norm(graph_global)
+        return seq_global, graph_global
+
+
+class PairRegressionHead(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int, dropout: float = 0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(4 * input_dim),
+            nn.Linear(4 * input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, a: pt.Tensor, b: pt.Tensor) -> pt.Tensor:
+        feat = pt.cat([a, b, a * b, (a - b).abs()], dim=-1)
+        return self.net(feat).squeeze(-1)
+
+
+class ProjectionHead(nn.Module):
+    def __init__(self, input_dim: int, proj_dim: int, dropout: float = 0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, input_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(input_dim, proj_dim),
+        )
+
+    def forward(self, x: pt.Tensor) -> pt.Tensor:
+        return self.net(x)
 
 
 class DualEncoderRetriever(nn.Module):
@@ -159,91 +240,172 @@ class DualEncoderRetriever(nn.Module):
         vocab_size: int,
         node_feat_dim: int,
         edge_feat_dim: int,
-        query_d_model: int = 256,
-        query_nhead: int = 8,
-        query_num_layers: int = 1,
-        gnn_dim: int = 256,
-        gnn_num_layers: int = 1,
+        hidden_dim: int = 512,
+        proj_dim: int = 256,
+        gnn_num_layers: int = 3,
+        transformer_num_layers: int = 1,
+        transformer_heads: int = 8,
+        max_seq_len: int = 4096,
         dropout: float = 0.1,
         normalize: bool = True,
-        margin: float = 0.2,
+        temperature: float = 0.07,
     ):
         super().__init__()
-        self.margin = margin
-        self.query_encoder = SequenceEncoder(
-            vocab_size=vocab_size,
-            d_model=query_d_model,
-            nhead=query_nhead,
-            num_layers=query_num_layers,
-            dropout=dropout,
-        )
-        self.cand_encoder = GraphEncoder(
+        self.hidden_dim = hidden_dim
+        self.seq_dim = hidden_dim
+        self.graph_hidden_dim = hidden_dim + node_feat_dim
+        self.proj_dim = proj_dim
+        self.embed_dim = proj_dim
+        self.normalize = normalize
+        self.temperature = float(temperature)
+
+        self.shared_encoder = SharedSeqGraphEncoder(
             vocab_size=vocab_size,
             node_feat_dim=node_feat_dim,
             edge_feat_dim=edge_feat_dim,
-            gnn_dim=gnn_dim,
+            hidden_dim=hidden_dim,
             gnn_num_layers=gnn_num_layers,
+            transformer_num_layers=transformer_num_layers,
+            transformer_heads=transformer_heads,
+            dropout=dropout,
+            max_seq_len=max_seq_len,
+        )
+
+        self.rank_head = ProjectionHead(
+            input_dim=self.graph_hidden_dim,
+            proj_dim=proj_dim,
             dropout=dropout,
         )
-        self.normalize = normalize
 
-    def encode_query(self, query_seqs, query_mask):
-        q = self.query_encoder(query_seqs, query_mask)
-        return q
+        self.seqid_head = PairRegressionHead(
+            input_dim=self.seq_dim,
+            hidden_dim=max(32, self.seq_dim // 2),
+            dropout=dropout,
+        )
 
-    def encode_cand(self, cand_seqs, cand_masks, cand_graphs):
-        c = self.cand_encoder(cand_seqs, cand_masks, cand_graphs)
-        return c
+        self.tmscore_head = PairRegressionHead(
+            input_dim=self.graph_hidden_dim,
+            hidden_dim=max(32, self.graph_hidden_dim // 2),
+            dropout=dropout,
+        )
 
-    def encode(self, data, mode:str='query'): # 建库/检索时用
-        if mode == 'query':
-            query_seqs, query_masks = data['seqs_pad'], data['masks']
-            emb = self.encode_query(query_seqs, query_masks)
-        elif mode == 'cand':
-            cand_seqs, cand_masks, cand_graphs = data['seqs_pad'], data['masks'], data['graphs']
-            emb = self.encode_cand(cand_seqs, cand_masks, cand_graphs)
-        if self.normalize:
-            emb = F.normalize(emb, p=2, dim=-1)
-        return emb
+    def _maybe_normalize(self, x: pt.Tensor) -> pt.Tensor:
+        return F.normalize(x, p=2, dim=-1) if self.normalize else x
 
-    def forward(self, batch):
-        query_seqs = batch["query_seqs"]
-        query_masks = batch["query_masks"]
+    def encode_backbone(self, seqs: pt.Tensor, masks: pt.Tensor, graphs):
+        return self.shared_encoder(seqs, masks, graphs)
 
-        # 带显式负样本的 margin ranking（推荐）
-        if "pos_cand_seqs" in batch:
-            pos_seqs = batch["pos_cand_seqs"]
-            pos_masks = batch["pos_cand_masks"]
-            pos_graphs = batch["pos_cand_graphs"]
-            neg_seqs = batch["neg_cand_seqs"]
-            neg_masks = batch["neg_cand_masks"]
-            neg_graphs = batch["neg_cand_graphs"]
-            num_neg = int(batch["num_neg"])
-            B = query_seqs.size(0)
+    def encode(self, data: Dict[str, pt.Tensor]) -> pt.Tensor:
+        _, graph_repr = self.encode_backbone(data['seqs_pad'], data['masks'], data['graphs'])
+        emb = self.rank_head(graph_repr)
+        return self._maybe_normalize(emb)
 
-            q_emb = self.encode_query(query_seqs, query_masks)  # [B, D]
-            pos_emb = self.encode_cand(pos_seqs, pos_masks, pos_graphs)  # [B, D]
-            neg_emb = self.encode_cand(neg_seqs, neg_masks, neg_graphs)  # [B*num_neg, D]
-            if self.normalize:
-                q_emb = F.normalize(q_emb, p=2, dim=-1)
-                pos_emb = F.normalize(pos_emb, p=2, dim=-1)
-                neg_emb = F.normalize(neg_emb, p=2, dim=-1)
+    def forward(self, batch: Dict[str, pt.Tensor]):
+        q_seq, q_graph = self.encode_backbone(
+            batch['query_seqs'], batch['query_masks'], batch['query_graphs']
+        )
+        p_seq, p_graph = self.encode_backbone(
+            batch['pos_seqs'], batch['pos_masks'], batch['pos_graphs']
+        )
 
-            neg_emb = neg_emb.view(B, num_neg, -1)
-            sim_pos = (q_emb * pos_emb).sum(dim=-1)  # [B]
-            sim_neg = (q_emb.unsqueeze(1) * neg_emb).sum(dim=-1)  # [B, num_neg]
-            # 希望 sim_pos > sim_neg + margin
-            loss = F.relu(self.margin - (sim_pos.unsqueeze(1) - sim_neg)).mean()
-            return {"loss": loss}
+        q_rank = self._maybe_normalize(self.rank_head(q_graph))
+        p_rank = self._maybe_normalize(self.rank_head(p_graph))
+        sim_matrix = q_rank @ p_rank.transpose(0, 1)
+        logits = sim_matrix / max(self.temperature, 1e-8)
+        targets = pt.arange(logits.size(0), device=logits.device)
+        info_nce_loss = F.cross_entropy(logits, targets)
 
-        # 兼容旧版：单正样本 + MSE(cos_sim, score/0.4)
-        cand_seqs = batch["cand_seqs"]
-        cand_masks = batch["cand_masks"]
-        cand_graphs = batch["cand_graphs"]
-        scores = batch["scores"]
-        q_emb = self.encode_query(query_seqs, query_masks)  # [B, D]
-        c_emb = self.encode_cand(cand_seqs, cand_masks, cand_graphs)  # [B, D]
-        cos_sim = F.cosine_similarity(q_emb, c_emb)
-        target = (scores / 0.4).clamp(min=0.0, max=1.0)
-        loss = F.mse_loss(cos_sim, target)
-        return {"loss": loss}
+        pos_score = sim_matrix.diag()
+        if sim_matrix.size(0) > 1:
+            neg_mask = pt.eye(sim_matrix.size(0), dtype=pt.bool, device=sim_matrix.device)
+            neg_score = sim_matrix.masked_fill(neg_mask, float('-inf')).max(dim=-1).values
+        else:
+            neg_score = pt.zeros_like(pos_score)
+
+        seqid_pred = self.seqid_head(q_seq, p_seq)
+        tmscore_pred = self.tmscore_head(q_graph, p_graph)
+
+        return {
+            'info_nce_loss': info_nce_loss,
+            'seqid_pred': seqid_pred,
+            'tmscore_pred': tmscore_pred,
+            'pos_score': pos_score,
+            'neg_score': neg_score,
+            'logits': logits,
+            'q_seq': q_seq,
+            'p_seq': p_seq,
+            'q_graph': q_graph,
+            'p_graph': p_graph,
+            'q_rank': q_rank,
+            'p_rank': p_rank,
+        }
+
+
+class MultiTaskOptimizer(pt.optim.AdamW):
+    def __init__(
+        self,
+        ranker: nn.Module,
+        lr: float,
+        weight_decay: float = 0.0,
+        alpha_tmscore: float = 0.2,
+        alpha_seqid: float = 0.1,
+        aux_loss_type: str = 'smooth_l1',
+        aux_beta: float = 0.05,
+    ):
+        self.alpha_tmscore = float(alpha_tmscore)
+        self.alpha_seqid = float(alpha_seqid)
+        self.aux_loss_type = str(aux_loss_type)
+        self.aux_beta = float(aux_beta)
+        super().__init__(ranker.parameters(), lr=lr, weight_decay=weight_decay)
+
+    def _reg_loss(self, pred: pt.Tensor, target: pt.Tensor) -> pt.Tensor:
+        target = target.float()
+        if self.aux_loss_type == 'smooth_l1':
+            return F.smooth_l1_loss(pred, target, beta=self.aux_beta)
+        if self.aux_loss_type == 'mse':
+            return F.mse_loss(pred, target)
+        if self.aux_loss_type == 'l1':
+            return F.l1_loss(pred, target)
+        raise ValueError("aux_loss_type must be one of {'smooth_l1', 'mse', 'l1'}")
+
+    def combine_loss(
+        self,
+        rank_loss: pt.Tensor,
+        tmscore_pred: pt.Tensor,
+        tmscore_true: pt.Tensor,
+        seqid_pred: pt.Tensor,
+        seqid_true: pt.Tensor,
+    ):
+        tmscore_aux = self._reg_loss(tmscore_pred, tmscore_true)
+        seqid_aux = self._reg_loss(seqid_pred, seqid_true)
+        total_loss = rank_loss + self.alpha_tmscore * tmscore_aux + self.alpha_seqid * seqid_aux
+        return total_loss, tmscore_aux, seqid_aux
+
+    def _step(
+        self,
+        rank_loss: pt.Tensor,
+        tmscore_pred: pt.Tensor,
+        tmscore_true: pt.Tensor,
+        seqid_pred: pt.Tensor,
+        seqid_true: pt.Tensor,
+        grad_clip: float = 1.0,
+    ):
+        loss, tmscore_aux, seqid_aux = self.combine_loss(
+            rank_loss,
+            tmscore_pred,
+            tmscore_true,
+            seqid_pred,
+            seqid_true,
+        )
+        self.zero_grad(set_to_none=True)
+        loss.backward()
+        grad_norm = pt.nn.utils.clip_grad_norm_(self.param_groups[0]['params'], grad_clip)
+        self.step()
+        if not isinstance(grad_norm, pt.Tensor):
+            grad_norm = pt.tensor(float(grad_norm))
+        return {
+            'loss': loss.detach(),
+            'tmscore_aux': tmscore_aux.detach(),
+            'seqid_aux': seqid_aux.detach(),
+            'grad_norm': grad_norm.detach(),
+        }
