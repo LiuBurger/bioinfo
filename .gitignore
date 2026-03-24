@@ -8,3 +8,7 @@ __pycache__
 *.pth
 *.txt
 project/TMalign
+checkpoints
+data
+log
+model
