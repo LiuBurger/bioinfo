@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import shutil
 import subprocess
 import re
@@ -13,12 +12,9 @@ import numpy as np
 import torch as pt
 from sklearn.model_selection import train_test_split
 
-try:
-    from utils.data import ProteinDataset, QueryHomologyDataset
-    from utils.tools import calculate_remote_homology_score
-except ImportError:  # standalone / flat-file mode
-    from data import ProteinDataset, QueryHomologyDataset
-    from tools import calculate_remote_homology_score
+from utils.data import ProteinDataset, QueryHomologyDataset
+from utils.tools import calculate_remote_homology_score
+
 
 
 # 假设 0 是 padding，1..20 依次对应这 20 个天然氨基酸。
