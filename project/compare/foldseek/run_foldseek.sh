@@ -1,0 +1,17 @@
+python foldseek_retrieval.py \
+  --data_path ./data/sorted_1300_p0_h1.pt \
+  --pair_file ./data/tmalign.out \
+  --pdb_root ../../data/pdb \
+  --foldseek foldseek \
+  --workspace ./foldseek_workspace \
+  --query_split test \
+  --test_size 1024 \
+  --topk 12 \
+  --alignment_type 2 \
+  --threads 16 \
+  --evaluate_with_tmalign \
+  --tmalign_path ./TMalign \
+  --result_tsv ./foldseek_results_raw.tsv \
+  --rank_tsv ./foldseek_results_topk.tsv \
+  --json_out ./foldseek_results_topk.json \
+  --metrics_out ./foldseek_metrics.json
