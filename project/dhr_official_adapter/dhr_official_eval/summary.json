@@ -1,0 +1,15 @@
+{
+  "query_count": 1024,
+  "eval_subset": "test_split",
+  "search_k": 200,
+  "topk": 12,
+  "metric": "l2",
+  "self_hit_rate": 0.9990234375,
+  "avg_top1_score": 0.16874437500000009,
+  "avg_topk_score": 0.01472595458984378,
+  "avg_top1_tm": 0.7929650781249993,
+  "avg_top1_seqid": 0.29982324218749973,
+  "valid_queries": 1024,
+  "failed_tmalign_tasks": 0,
+  "first_error": null
+}
