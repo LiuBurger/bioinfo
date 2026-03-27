@@ -1,4 +1,5 @@
 from typing import Dict
+import math
 
 import torch as pt
 import torch.nn as nn
@@ -45,6 +46,145 @@ class GINEBackbone(nn.Module):
         return x
 
 
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dim: int, base: float = 10000.0):
+        super().__init__()
+        if dim % 2 != 0:
+            raise ValueError(f'RoPE head dim must be even, but got dim={dim}.')
+        self.dim = dim
+        self.base = float(base)
+        inv_freq = 1.0 / (self.base ** (pt.arange(0, dim, 2).float() / dim))
+        self.register_buffer('inv_freq', inv_freq, persistent=False)
+        self._seq_len_cached = 0
+        self._cos_cached = None
+        self._sin_cached = None
+
+    def _build_cache(self, seq_len: int, device: pt.device, dtype: pt.dtype):
+        pos = pt.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
+        freqs = pt.outer(pos, self.inv_freq.to(device=device))
+        emb = pt.cat([freqs, freqs], dim=-1)
+        cos = emb.cos().to(dtype=dtype)
+        sin = emb.sin().to(dtype=dtype)
+        self._seq_len_cached = seq_len
+        self._cos_cached = cos[None, None, :, :]
+        self._sin_cached = sin[None, None, :, :]
+
+    def forward(self, seq_len: int, device: pt.device, dtype: pt.dtype):
+        need_refresh = (
+            self._cos_cached is None
+            or self._sin_cached is None
+            or self._seq_len_cached < seq_len
+            or self._cos_cached.device != device
+            or self._cos_cached.dtype != dtype
+        )
+        if need_refresh:
+            self._build_cache(seq_len=seq_len, device=device, dtype=dtype)
+        return self._cos_cached[:, :, :seq_len, :], self._sin_cached[:, :, :seq_len, :]
+
+    @staticmethod
+    def rotate_half(x: pt.Tensor) -> pt.Tensor:
+        x_even = x[..., ::2]
+        x_odd = x[..., 1::2]
+        x_rot = pt.stack((-x_odd, x_even), dim=-1)
+        return x_rot.flatten(start_dim=-2)
+
+    def apply(self, q: pt.Tensor, k: pt.Tensor):
+        _, _, seq_len, _ = q.shape
+        cos, sin = self(seq_len=seq_len, device=q.device, dtype=q.dtype)
+        q = (q * cos) + (self.rotate_half(q) * sin)
+        k = (k * cos) + (self.rotate_half(k) * sin)
+        return q, k
+
+
+class RoPEMultiheadSelfAttention(nn.Module):
+    def __init__(
+        self,
+        model_dim: int,
+        num_heads: int,
+        dropout: float = 0.1,
+        rope_base: float = 10000.0,
+    ):
+        super().__init__()
+        if model_dim % num_heads != 0:
+            raise ValueError(f'model_dim ({model_dim}) must be divisible by num_heads ({num_heads}).')
+        self.model_dim = model_dim
+        self.num_heads = num_heads
+        self.head_dim = model_dim // num_heads
+        if self.head_dim % 2 != 0:
+            raise ValueError(
+                f'RoPE requires an even head_dim, but got head_dim={self.head_dim}. '
+                f'Please choose model_dim / num_heads so that each head dimension is even.'
+            )
+        self.scale = self.head_dim ** -0.5
+        self.qkv_proj = nn.Linear(model_dim, 3 * model_dim)
+        self.out_proj = nn.Linear(model_dim, model_dim)
+        self.attn_dropout = nn.Dropout(dropout)
+        self.rope = RotaryEmbedding(dim=self.head_dim, base=rope_base)
+
+    def forward(self, x: pt.Tensor, key_padding_mask: pt.Tensor = None) -> pt.Tensor:
+        bsz, seqlen, _ = x.shape
+        qkv = self.qkv_proj(x)
+        qkv = qkv.view(bsz, seqlen, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=2)
+
+        q = q.permute(0, 2, 1, 3)
+        k = k.permute(0, 2, 1, 3)
+        v = v.permute(0, 2, 1, 3)
+
+        q, k = self.rope.apply(q, k)
+
+        attn_mask = None
+        if key_padding_mask is not None:
+            # F.scaled_dot_product_attention uses bool masks where True means
+            # the key position is visible and False means masked out.
+            attn_mask = (~key_padding_mask)[:, None, None, :]
+
+        out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            dropout_p=self.attn_dropout.p if self.training else 0.0,
+            is_causal=False,
+            scale=self.scale,
+        )
+        out = out.permute(0, 2, 1, 3).contiguous().view(bsz, seqlen, self.model_dim)
+        return self.out_proj(out)
+
+
+class RoPETransformerEncoderLayer(nn.Module):
+    def __init__(
+        self,
+        model_dim: int,
+        num_heads: int,
+        dim_feedforward: int,
+        dropout: float = 0.1,
+        rope_base: float = 10000.0,
+    ):
+        super().__init__()
+        self.self_attn = RoPEMultiheadSelfAttention(
+            model_dim=model_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            rope_base=rope_base,
+        )
+        self.norm1 = nn.LayerNorm(model_dim)
+        self.norm2 = nn.LayerNorm(model_dim)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.ffn = nn.Sequential(
+            nn.Linear(model_dim, dim_feedforward),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, model_dim),
+        )
+
+    def forward(self, x: pt.Tensor, key_padding_mask: pt.Tensor = None) -> pt.Tensor:
+        x = x + self.dropout1(self.self_attn(self.norm1(x), key_padding_mask=key_padding_mask))
+        x = x + self.dropout2(self.ffn(self.norm2(x)))
+        return x
+
+
 class SequenceTransformer(nn.Module):
     def __init__(
         self,
@@ -54,45 +194,51 @@ class SequenceTransformer(nn.Module):
         num_layers: int = 1,
         dropout: float = 0.1,
         max_seq_len: int = 2048,
+        rope_base: float = 10000.0,
     ):
         super().__init__()
         if model_dim % num_heads != 0:
             raise ValueError(f'model_dim ({model_dim}) must be divisible by num_heads ({num_heads}).')
+        if (model_dim // num_heads) % 2 != 0:
+            raise ValueError(
+                f'RoPE requires an even head dimension, but model_dim // num_heads = '
+                f'{model_dim // num_heads}. Please adjust model_dim or num_heads.'
+            )
+
         self.model_dim = model_dim
         self.max_seq_len = max_seq_len
 
         self.token_embed = nn.Embedding(vocab_size, model_dim, padding_idx=0)
-        self.pos_embed = nn.Embedding(max_seq_len, model_dim)
         self.embed_norm = nn.LayerNorm(model_dim)
         self.embed_dropout = nn.Dropout(dropout)
-
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=model_dim,
-            nhead=num_heads,
-            dim_feedforward=4 * model_dim,
-            dropout=dropout,
-            activation='gelu',
-            batch_first=True,
-            norm_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.encoder = nn.ModuleList([
+            RoPETransformerEncoderLayer(
+                model_dim=model_dim,
+                num_heads=num_heads,
+                dim_feedforward=4 * model_dim,
+                dropout=dropout,
+                rope_base=rope_base,
+            )
+            for _ in range(num_layers)
+        ])
         self.out_norm = nn.LayerNorm(model_dim)
 
     def forward(self, seq: pt.Tensor, mask: pt.Tensor):
-        bsz, seqlen = seq.shape
+        _, seqlen = seq.shape
         if seqlen > self.max_seq_len:
             raise ValueError(
                 f'sequence length {seqlen} exceeds max_seq_len={self.max_seq_len}. '
                 f'Increase max_seq_len in model config.'
             )
 
-        pos = pt.arange(seqlen, device=seq.device).unsqueeze(0).expand(bsz, seqlen)
-        x = self.token_embed(seq) + self.pos_embed(pos)
+        x = self.token_embed(seq)
         x = self.embed_norm(x)
         x = self.embed_dropout(x)
 
         key_padding_mask = (mask == 0)
-        x = self.encoder(x, src_key_padding_mask=key_padding_mask)
+        for layer in self.encoder:
+            x = layer(x, key_padding_mask=key_padding_mask)
+
         x = self.out_norm(x)
         x = x * mask.unsqueeze(-1).float()
         return x
@@ -127,6 +273,7 @@ class SharedSeqGraphEncoder(nn.Module):
         dropout: float = 0.1,
         max_seq_len: int = 2048,
         attn_gate_hidden: int = None,
+        rope_base: float = 10000.0,
     ):
         super().__init__()
         seq_dim = hidden_dim
@@ -149,6 +296,7 @@ class SharedSeqGraphEncoder(nn.Module):
             num_layers=transformer_num_layers,
             dropout=dropout,
             max_seq_len=max_seq_len,
+            rope_base=rope_base,
         )
         self.gnn = GINEBackbone(
             hidden_dim=graph_hidden_dim,
@@ -233,7 +381,7 @@ class ProjectionHead(nn.Module):
         return self.net(x)
 
 
-class DualEncoderRetriever(nn.Module):
+class Protein2Vec(nn.Module):
     def __init__(
         self,
         vocab_size: int,
@@ -248,6 +396,7 @@ class DualEncoderRetriever(nn.Module):
         dropout: float = 0.1,
         normalize: bool = True,
         temperature: float = 0.07,
+        rope_base: float = 10000.0,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -268,6 +417,7 @@ class DualEncoderRetriever(nn.Module):
             transformer_heads=transformer_heads,
             dropout=dropout,
             max_seq_len=max_seq_len,
+            rope_base=rope_base,
         )
 
         self.rank_head = ProjectionHead(

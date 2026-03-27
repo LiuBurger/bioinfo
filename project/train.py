@@ -10,7 +10,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
 
 from utils.data import ProteinDataset, QueryHomologyDataset, collate_fun_train, collate_fun_emb
-from utils.model import DualEncoderRetriever, MultiTaskOptimizer
+from utils.model import Protein2Vec, MultiTaskOptimizer
 from utils.tools import build_idx, calculate_remote_homology_score, gen_embeddings, move_batch_to_device
 
 
@@ -19,8 +19,8 @@ def parse_args():
 
     # training
     parser.add_argument('--epochs', type=int, default=200)
-    parser.add_argument('--gpu', type=int, default=7)
-    parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--gpu', type=int, default=6)
+    parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--eval_batch_size', type=int, default=32)
     parser.add_argument('--num_workers', type=int, default=8)
 
@@ -42,7 +42,8 @@ def parse_args():
     parser.add_argument('--gnn_num_layers', type=int, default=3)
     parser.add_argument('--transformer_num_layers', type=int, default=1)
     parser.add_argument('--transformer_heads', type=int, default=8)
-    parser.add_argument('--max_seq_len', type=int, default=2048)
+    parser.add_argument('--max_seq_len', type=int, default=1300)
+    parser.add_argument('--rope_base', type=float, default=10000.0)
     parser.add_argument('--dropout', type=float, default=0.1)
     parser.add_argument('--normalize', action='store_true', default=True)
     parser.add_argument('--no_normalize', action='store_false', dest='normalize')
@@ -71,11 +72,11 @@ def parse_args():
     parser.add_argument('--no_save_last', action='store_false', dest='save_last')
 
     # paths
-    parser.add_argument('--data_path', type=str, default='./data/sorted_1300_p0_h1.pt')
+    parser.add_argument('--data_path', type=str, default='./data/sorted_1300_p1_h1.pt')
     parser.add_argument('--pdb_root', type=str, default='../../data/pdb')
     parser.add_argument('--tmalign_path', type=str, default='./TMalign')
     parser.add_argument('--pair_file', type=str, default='./data/tmalign.out')
-    parser.add_argument('--model_name', type=str, default='TransGINE_AttnPool_TMscore_p0h1')
+    parser.add_argument('--model_name', type=str, default='encode_no_rank_head')
 
     return parser.parse_args()
 
@@ -410,7 +411,7 @@ if __name__ == '__main__':
 
     device = pt.device(f'cuda:{config.gpu}' if pt.cuda.is_available() else 'cpu')
     sample_graph = lib_data[0]['graph']
-    model = DualEncoderRetriever(
+    model = Protein2Vec(
         vocab_size=config.vocab_size,
         node_feat_dim=sample_graph.x.shape[1],
         edge_feat_dim=sample_graph.edge_attr.shape[1] if getattr(sample_graph, 'edge_attr', None) is not None else 1,
@@ -421,6 +422,7 @@ if __name__ == '__main__':
         transformer_heads=config.transformer_heads,
         max_seq_len=config.max_seq_len,
         dropout=config.dropout,
+        rope_base=config.rope_base,
         normalize=config.normalize,
         temperature=config.temperature,
     ).to(device)
