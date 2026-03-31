@@ -1,5 +1,4 @@
 from typing import Dict
-import math
 
 import torch as pt
 import torch.nn as nn
@@ -140,9 +139,7 @@ class RoPEMultiheadSelfAttention(nn.Module):
             attn_mask = (~key_padding_mask)[:, None, None, :]
 
         out = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
+            q, k, v,
             attn_mask=attn_mask,
             dropout_p=self.attn_dropout.p if self.training else 0.0,
             is_causal=False,
@@ -471,8 +468,8 @@ class Protein2Vec(nn.Module):
         else:
             neg_score = pt.zeros_like(pos_score)
 
-        seqid_pred = self.seqid_head(q_seq, p_seq)
-        tmscore_pred = self.tmscore_head(q_graph, p_graph)
+        seqid_pred = F.sigmoid(self.seqid_head(q_seq, p_seq))
+        tmscore_pred = F.sigmoid(self.tmscore_head(q_graph, p_graph))
 
         return {
             'info_nce_loss': info_nce_loss,

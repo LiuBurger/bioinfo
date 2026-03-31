@@ -59,7 +59,7 @@ def parse_args():
 
     # checkpoint / early stop / scheduler
     parser.add_argument('--save_dir', type=str, default='./checkpoints')
-    parser.add_argument('--monitor', type=str, default='top1', choices=['top1', 'topk'])
+    parser.add_argument('--monitor', type=str, default='topk', choices=['top1', 'topk'])
     parser.add_argument('--min_delta', type=float, default=1e-4)
     parser.add_argument('--early_stop_patience', type=int, default=5,
                         help='number of evaluation rounds without improvement before stopping')
@@ -76,7 +76,7 @@ def parse_args():
     parser.add_argument('--pdb_root', type=str, default='../../data/pdb')
     parser.add_argument('--tmalign_path', type=str, default='./TMalign')
     parser.add_argument('--pair_file', type=str, default='./data/tmalign.out')
-    parser.add_argument('--model_name', type=str, default='encode_no_rank_head')
+    parser.add_argument('--model_name', type=str, default='2Trans')
 
     return parser.parse_args()
 
@@ -374,7 +374,6 @@ if __name__ == '__main__':
         test_size=config.test_size,
         random_state=config.random_state,
     )
-    test_map = np.sort(test_map)
 
     train_set = QueryHomologyDataset(queryhomo, mapping=train_map)
     test_set = QueryHomologyDataset(queryhomo, mapping=test_map)
