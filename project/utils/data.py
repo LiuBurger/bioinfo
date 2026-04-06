@@ -8,30 +8,6 @@ from torch.nn.utils.rnn import pad_sequence
 from torch_geometric.data import Batch
 
 
-def _to_1d_long_tensor(seq):
-    if isinstance(seq, np.ndarray):
-        seq = pt.from_numpy(seq)
-    elif not pt.is_tensor(seq):
-        seq = pt.as_tensor(seq)
-    return seq.long().view(-1)
-
-
-def _trim_right_padding(seq, pad_value: int = 0):
-    seq = _to_1d_long_tensor(seq)
-    valid_pos = (seq != pad_value).nonzero(as_tuple=False)
-    if valid_pos.numel() == 0:
-        return seq[:1]
-    keep_len = int(valid_pos[-1].item()) + 1
-    return seq[:keep_len]
-
-
-def _pad_trimmed_sequences(seqs, pad_value: int = 0):
-    trimmed = [_trim_right_padding(seq, pad_value=pad_value) for seq in seqs]
-    seqs_pad = pad_sequence(trimmed, batch_first=True, padding_value=pad_value)
-    masks = (seqs_pad != pad_value).long()
-    return seqs_pad, masks
-
-
 def load(fn, mode: str = 'all'):
     with h5py.File(fn) as f:
         seq = f['node_seq'][()].astype(np.int32)
@@ -176,8 +152,10 @@ def collate_fun_train(protein_dataset: ProteinDataset, positive_top_ratio: float
             seqids.append(seqid_value)
             remote_scores.append(remote_value)
 
-        query_seqs, query_masks = _pad_trimmed_sequences(query_seqs, pad_value=0)
-        pos_seqs, pos_masks = _pad_trimmed_sequences(pos_seqs, pad_value=0)
+        query_seqs = pad_sequence(query_seqs, batch_first=True, padding_value=0)
+        query_masks = (query_seqs != 0).float()
+        pos_seqs = pad_sequence(pos_seqs, batch_first=True, padding_value=0)
+        pos_masks = (pos_seqs != 0).float()
 
         return {
             'query_seqs': query_seqs,
@@ -219,7 +197,8 @@ def collate_fun_emb(mode: str = 'query', protein_dataset: ProteinDataset = None)
         else:
             raise ValueError("mode must be either 'query' or 'cand'.")
 
-        seqs_pad, masks = _pad_trimmed_sequences(seqs, pad_value=0)
+        seqs_pad = pad_sequence(seqs, batch_first=True, padding_value=0)
+        masks = (seqs_pad != 0).float()
         return {
             'seqs_pad': seqs_pad,
             'masks': masks,

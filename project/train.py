@@ -58,7 +58,7 @@ def parse_args():
     parser.add_argument('--eval_interval', type=int, default=10)
 
     # checkpoint / early stop / scheduler
-    parser.add_argument('--save_dir', type=str, default='./checkpoints')
+    parser.add_argument('--save_dir', type=str, default='./model')
     parser.add_argument('--monitor', type=str, default='topk', choices=['top1', 'topk'])
     parser.add_argument('--min_delta', type=float, default=1e-4)
     parser.add_argument('--early_stop_patience', type=int, default=5,
@@ -76,7 +76,7 @@ def parse_args():
     parser.add_argument('--pdb_root', type=str, default='../../data/pdb')
     parser.add_argument('--tmalign_path', type=str, default='./TMalign')
     parser.add_argument('--pair_file', type=str, default='./data/tmalign.out')
-    parser.add_argument('--model_name', type=str, default='2Trans')
+    parser.add_argument('--model_name', type=str, default='Protein2Vec')
 
     return parser.parse_args()
 
